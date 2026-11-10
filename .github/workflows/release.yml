@@ -124,7 +124,12 @@ jobs:
             cp CHANGELOG.md release-pkg/ 2>/dev/null || true
             cp LICENSE release-pkg/ 2>/dev/null || true
 
-            makensis "/DOUT_FILE=${ROOT_DIR}/release-packages/${PKG_NAME}-setup.exe" assets/installer.nsi
+            MAKENSIS="/c/Program Files (x86)/NSIS/makensis.exe"
+            if [ ! -x "$MAKENSIS" ]; then
+              choco install nsis -y --no-progress
+            fi
+            WIN_ROOT="$(pwd -W)"
+            "$MAKENSIS" "/DOUT_FILE=${WIN_ROOT}/release-packages/${PKG_NAME}-setup.exe" assets/installer.nsi
 
             cd release-pkg
             7z a "${ROOT_DIR}/release-packages/${PKG_NAME}.zip" *
