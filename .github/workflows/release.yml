@@ -35,10 +35,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             use_cross: false
           - os: macos-latest
-            target: x86_64-apple-darwin
-            use_cross: false
-          - os: macos-latest
             target: aarch64-apple-darwin
+            extra_target: x86_64-apple-darwin
             use_cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -71,7 +69,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.extra_target && format('{0},{1}', matrix.target, matrix.extra_target) || matrix.target }}
 
       - name: Install Cross
         if: matrix.use_cross
@@ -84,6 +82,9 @@ jobs:
             cross build --release --target ${{ matrix.target }}
           else
             cargo build --release --target ${{ matrix.target }}
+            if [ -n "${{ matrix.extra_target }}" ]; then
+              cargo build --release --target ${{ matrix.extra_target }}
+            fi
           fi
 
       - name: Package archive
@@ -98,23 +99,26 @@ jobs:
 
           if [ "${{ runner.os }}" = "macOS" ]; then
             # macOS: 组装标准 AgentGate.app 应用包并封装为可拖拽安装的 .dmg 磁盘映像
-            DMG_STAGE="${ROOT_DIR}/dmg-staging"
-            APP_BUNDLE="${DMG_STAGE}/AgentGate.app"
-            mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+            for MAC_TARGET in ${{ matrix.target }} ${{ matrix.extra_target }}; do
+              MAC_PKG_NAME="AgentGate_${TAG_NAME}_${MAC_TARGET}"
+              DMG_STAGE="${ROOT_DIR}/dmg-staging-${MAC_TARGET}"
+              APP_BUNDLE="${DMG_STAGE}/AgentGate.app"
+              mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
 
-            cp "target/${{ matrix.target }}/release/agent-gate" "${APP_BUNDLE}/Contents/MacOS/agent-gate"
-            chmod +x "${APP_BUNDLE}/Contents/MacOS/agent-gate"
-            cp "assets/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
-            cp "assets/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+              cp "target/${MAC_TARGET}/release/agent-gate" "${APP_BUNDLE}/Contents/MacOS/agent-gate"
+              chmod +x "${APP_BUNDLE}/Contents/MacOS/agent-gate"
+              cp "assets/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+              cp "assets/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 
-            codesign --force --deep --sign - "${APP_BUNDLE}"
-            ln -s /Applications "${DMG_STAGE}/Applications"
+              codesign --force --deep --sign - "${APP_BUNDLE}"
+              ln -s /Applications "${DMG_STAGE}/Applications"
 
-            hdiutil create \
-              -volname "AgentGate" \
-              -srcfolder "${DMG_STAGE}" \
-              -ov -format UDZO \
-              "${ROOT_DIR}/release-packages/${PKG_NAME}.dmg"
+              hdiutil create \
+                -volname "AgentGate" \
+                -srcfolder "${DMG_STAGE}" \
+                -ov -format UDZO \
+                "${ROOT_DIR}/release-packages/${MAC_PKG_NAME}.dmg"
+            done
           elif [ "${{ runner.os }}" = "Windows" ]; then
             # Windows: 生成内嵌图标的无控制台 AgentGate.exe，产出 NSIS 安装包 (-setup.exe) 与便携版 (.zip)
             mkdir -p release-pkg
