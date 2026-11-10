@@ -375,6 +375,9 @@ pub fn platform_set_window_visible(visible: bool) {
 
     #[cfg(target_os = "windows")]
     windows_tray::set_visible(visible);
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    linux_tray::set_visible(visible);
 }
 
 #[cfg(target_os = "macos")]
@@ -532,11 +535,11 @@ mod windows_tray {
          NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIcon, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_EXSTYLE,
-        GetForegroundWindow, GetMessageW, GetWindowLongPtrW, MSG, RegisterClassW, SW_HIDE,
-        SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
-        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        CreateIcon, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GWL_EXSTYLE,
+        GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowThreadProcessId, MSG,
+        RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
+        TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
+        WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
     use windows::core::PCWSTR;
 
@@ -544,6 +547,30 @@ mod windows_tray {
 
     const WM_TRAYICON: u32 = WM_APP + 0x47;
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    unsafe fn find_process_main_window() -> Option<HWND> {
+        let current_pid = std::process::id();
+        let tray_raw = TRAY_HWND.load(Ordering::SeqCst);
+        let mut cursor = HWND::default();
+        while let Ok(candidate) = unsafe { FindWindowExW(None, Some(cursor), None, None) } {
+            if candidate.0.is_null() {
+                break;
+            }
+            cursor = candidate;
+            if candidate.0 as isize == tray_raw {
+                continue;
+            }
+            let mut win_pid = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(candidate, Some(&mut win_pid));
+            }
+            if win_pid == current_pid && unsafe { GetWindowTextLengthW(candidate) } > 0 {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 
     unsafe extern "system" fn tray_wnd_proc(
         hwnd: HWND,
@@ -587,6 +614,7 @@ mod windows_tray {
                 None,
             )
             .unwrap_or_default();
+            TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
 
             let size = 32u32;
             let rgba = generate_template_icon_rgba(size, [245, 250, 255]);
@@ -637,15 +665,14 @@ mod windows_tray {
         unsafe {
             let mut raw = MAIN_HWND.load(Ordering::SeqCst);
             if raw == 0 {
-                let fg = GetForegroundWindow();
-                if !fg.0.is_null() {
-                    raw = fg.0 as isize;
+                if let Some(found) = find_process_main_window() {
+                    raw = found.0 as isize;
                     MAIN_HWND.store(raw, Ordering::SeqCst);
                     // 移除任务栏图标（WS_EX_TOOLWINDOW 并不带 WS_EX_APPWINDOW）
-                    let ex = GetWindowLongPtrW(fg, GWL_EXSTYLE);
+                    let ex = GetWindowLongPtrW(found, GWL_EXSTYLE);
                     let new_ex =
                         (ex & !(WS_EX_APPWINDOW.0 as isize)) | (WS_EX_TOOLWINDOW.0 as isize);
-                    let _ = SetWindowLongPtrW(fg, GWL_EXSTYLE, new_ex);
+                    let _ = SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex);
                 }
             }
             if raw != 0 {
@@ -725,6 +752,14 @@ mod linux_tray {
                 std::mem::forget(handle);
             }
         });
+    }
+
+    pub fn set_visible(visible: bool) {
+        let pid = std::process::id().to_string();
+        let action = if visible { "windowmap" } else { "windowunmap" };
+        let _ = std::process::Command::new("xdotool")
+            .args(["search", "--pid", &pid, action, "%@"])
+            .status();
     }
 }
 

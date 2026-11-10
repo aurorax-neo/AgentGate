@@ -1,7 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::Local;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+static NEXT_AUDIT_LOG_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 远端真实机器认证方式（仅加密保存在本机，永不暴露给 Agent）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +109,9 @@ pub struct RelayHost {
     pub agent_auth_mode: AgentAuthMode,
     /// 本机为此条目生成的专用 Ed25519 私钥（OpenSSH PEM 格式）
     pub dedicated_key_openssh_pem: Option<String>,
+    /// 远端真实 SSH 主机公钥（OpenSSH 格式，首次连接 TOFU 绑定或手动固定，防中间人攻击）
+    #[serde(default)]
+    pub pinned_host_key_openssh: Option<String>,
     /// 创建时间与更新时间
     pub created_at: String,
     pub updated_at: String,
@@ -126,6 +133,7 @@ impl RelayHost {
             proxy: ProxyConfig::None,
             agent_auth_mode: AgentAuthMode::EphemeralPassword,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -234,6 +242,8 @@ impl RelayStatus {
 /// 审计与连接日志条目（严格脱敏，不包含真实远端 IP 或真实密码）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayAuditLog {
+    #[serde(default)]
+    pub seq: u64,
     pub timestamp: String,
     pub codename: String,
     pub event: String,
@@ -253,8 +263,20 @@ pub struct RelayRuntimeState {
 }
 
 impl RelayRuntimeState {
+    pub fn rotate_or_clear_temp_password(&mut self, next: Option<String>) {
+        if let Some(mut old) = self.current_temp_password.take() {
+            // 覆写旧临时密码内存字节后再释放
+            unsafe {
+                old.as_bytes_mut().fill(0);
+            }
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        }
+        self.current_temp_password = next;
+    }
+
     pub fn push_log(&mut self, codename: &str, event: impl Into<String>, detail: impl Into<String>, is_error: bool) {
         let entry = RelayAuditLog {
+            seq: NEXT_AUDIT_LOG_SEQ.fetch_add(1, Ordering::Relaxed),
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             codename: codename.to_string(),
             event: event.into(),

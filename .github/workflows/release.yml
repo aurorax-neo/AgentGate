@@ -45,7 +45,7 @@ jobs:
             use_cross: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # 规范：剥离本地特有的国内代理配置，防止海外 Runner 访问超时
       - name: Remove local package proxy in CI
@@ -69,7 +69,7 @@ jobs:
             libfreetype6-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -179,7 +179,7 @@ jobs:
           fi
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package-${{ matrix.target }}
           path: release-packages/*
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # ── 约束 1：Tag 必须符合 SemVer ──────────────────────────
       - name: Validate tag format (SemVer)
@@ -242,7 +242,7 @@ jobs:
           { echo "body<<__EOF__"; echo "$BODY"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
 
       - name: Download all package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: downloaded-artifacts
           pattern: package-*
@@ -264,7 +264,7 @@ jobs:
           gh release delete "$TAG" --yes 2>/dev/null || true
 
       - name: Upload assets to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           files: release-assets/*
           tag_name: ${{ inputs.tag || github.ref_name }}

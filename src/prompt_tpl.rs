@@ -105,6 +105,7 @@ mod tests {
             },
             agent_auth_mode: AgentAuthMode::EphemeralPassword,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: "2026-11-10 12:00:00".to_string(),
             updated_at: "2026-11-10 12:00:00".to_string(),
         };

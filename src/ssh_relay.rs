@@ -18,11 +18,14 @@ use russh::{
 };
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::models::{AgentAuthMode, RealAuthConfig, RelayHost};
+use crate::models::{AgentAuthMode, ProxyConfig, RealAuthConfig, RelayHost};
 use crate::proxy::connect_via_proxy;
+
+const UPSTREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 全局后台 Tokio 运行时，供 GPUI 前台线程非阻塞调度 SSH 服务与代理任务
 pub fn global_tokio_runtime() -> &'static tokio::runtime::Runtime {
@@ -48,11 +51,17 @@ pub enum RelayEvent {
     Stopped {
         host_id: Uuid,
         codename: String,
+        local_port: u16,
     },
     SessionsChanged {
         host_id: Uuid,
         active_sessions: usize,
         total_connections: u64,
+    },
+    HostKeyPinned {
+        host_id: Uuid,
+        codename: String,
+        pubkey_openssh: String,
     },
     AuditLog {
         host_id: Uuid,
@@ -64,6 +73,7 @@ pub enum RelayEvent {
     Error {
         host_id: Uuid,
         codename: String,
+        local_port: u16,
         message: String,
     },
 }
@@ -79,6 +89,7 @@ pub struct LiveCredentials {
 /// 单条运行中中转实例的控制句柄
 pub struct RunningRelayControl {
     pub local_port: u16,
+    pub live_host: Arc<RwLock<RelayHost>>,
     pub live_creds: Arc<RwLock<LiveCredentials>>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -91,6 +102,12 @@ impl RunningRelayControl {
     pub fn update_credentials(&self, creds: LiveCredentials) {
         if let Ok(mut guard) = self.live_creds.write() {
             *guard = creds;
+        }
+    }
+
+    pub fn update_host(&self, host: RelayHost) {
+        if let Ok(mut guard) = self.live_host.write() {
+            *guard = host;
         }
     }
 }
@@ -127,6 +144,8 @@ pub async fn start_host_relay(
     server_cfg.preferred = Preferred::default();
     let server_cfg = Arc::new(server_cfg);
 
+    let live_host = Arc::new(RwLock::new(host.clone()));
+    let live_host_for_loop = live_host.clone();
     let live_creds = Arc::new(RwLock::new(initial_creds));
     let live_creds_for_loop = live_creds.clone();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -166,7 +185,7 @@ pub async fn start_host_relay(
                         Ok((socket, peer_addr)) => {
                             let _ = socket.set_nodelay(true);
                             let cfg = server_cfg.clone();
-                            let host_clone = host.clone();
+                            let host_lock = live_host_for_loop.clone();
                             let creds_clone = live_creds_for_loop.clone();
                             let tx = event_tx.clone();
                             let active_counter = active_sessions.clone();
@@ -175,7 +194,7 @@ pub async fn start_host_relay(
 
                             tokio::spawn(async move {
                                 let handler = LocalSshHandler::new(
-                                    host_clone.clone(),
+                                    host_lock.clone(),
                                     creds_clone,
                                     peer_addr,
                                     tx.clone(),
@@ -187,22 +206,29 @@ pub async fn start_host_relay(
                                     _ = client_shutdown.changed() => {}
                                     res = session_fut => {
                                         if let Err(err) = res {
-                                            let _ = tx.send(RelayEvent::AuditLog {
-                                                host_id: host_clone.id,
-                                                codename: host_clone.codename.clone(),
-                                                event: "会话断开".to_string(),
-                                                detail: format!("本地连接结束 ({})", sanitize_error(&err.to_string(), &host_clone)),
-                                                is_error: false,
-                                            });
+                                            if let Ok(h) = host_lock.read() {
+                                                let _ = tx.send(RelayEvent::AuditLog {
+                                                    host_id: h.id,
+                                                    codename: h.codename.clone(),
+                                                    event: "会话断开".to_string(),
+                                                    detail: format!("本地连接结束 ({})", sanitize_error(&err.to_string(), &h)),
+                                                    is_error: false,
+                                                });
+                                            }
                                         }
                                     }
                                 }
                             });
                         }
                         Err(e) => {
+                            let cur_codename = live_host_for_loop
+                                .read()
+                                .map(|h| h.codename.clone())
+                                .unwrap_or_else(|_| codename.clone());
                             let _ = event_tx.send(RelayEvent::Error {
                                 host_id,
-                                codename: codename.clone(),
+                                codename: cur_codename,
+                                local_port,
                                 message: format!("本地端口接收连接异常: {}", e),
                             });
                             break;
@@ -212,13 +238,18 @@ pub async fn start_host_relay(
             }
         }
 
+        let final_codename = live_host_for_loop
+            .read()
+            .map(|h| h.codename.clone())
+            .unwrap_or(codename);
         let _ = event_tx.send(RelayEvent::Stopped {
             host_id,
-            codename: codename.clone(),
+            codename: final_codename.clone(),
+            local_port,
         });
         let _ = event_tx.send(RelayEvent::AuditLog {
             host_id,
-            codename,
+            codename: final_codename,
             event: "本地监听已停止".to_string(),
             detail: format!("已释放 127.0.0.1:{}", local_port),
             is_error: false,
@@ -227,41 +258,118 @@ pub async fn start_host_relay(
 
     Ok(RunningRelayControl {
         local_port,
+        live_host,
         live_creds,
         shutdown_tx,
     })
 }
 
 /// 上游 SSH 客户端处理器（连接真实远端 SSH 主机）
-struct UpstreamClientHandler;
+struct UpstreamClientHandler {
+    live_host: Option<Arc<RwLock<RelayHost>>>,
+    event_tx: Option<mpsc::UnboundedSender<RelayEvent>>,
+}
+
+impl UpstreamClientHandler {
+    fn new(live_host: Arc<RwLock<RelayHost>>, event_tx: mpsc::UnboundedSender<RelayEvent>) -> Self {
+        Self {
+            live_host: Some(live_host),
+            event_tx: Some(event_tx),
+        }
+    }
+
+    #[cfg(test)]
+    fn permissive_for_test() -> Self {
+        Self {
+            live_host: None,
+            event_tx: None,
+        }
+    }
+}
 
 impl client::Handler for UpstreamClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKeyOrCertificate,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let Some(live_host) = &self.live_host else {
+            return Ok(true);
+        };
+
+        let presented_openssh = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key.to_openssh().ok(),
+            PublicKeyOrCertificate::Certificate(cert) => cert.to_openssh().ok(),
+        };
+        let Some(presented) = presented_openssh else {
+            return Ok(false);
+        };
+
+        let existing_check = live_host
+            .read()
+            .ok()
+            .map(|h| (h.id, h.codename.clone(), h.pinned_host_key_openssh.clone()));
+
+        let Some((host_id, codename, pinned_opt)) = existing_check else {
+            return Ok(false);
+        };
+
+        if let Some(pinned) = pinned_opt {
+            let matched: bool = pinned.as_bytes().ct_eq(presented.as_bytes()).into();
+            if !matched {
+                if let Some(tx) = &self.event_tx {
+                    let _ = tx.send(RelayEvent::AuditLog {
+                        host_id,
+                        codename,
+                        event: "主机密钥校验拦截".to_string(),
+                        detail: "远端 SSH 主机公钥与已绑定指纹不匹配，已阻断连接以防范中间人攻击".to_string(),
+                        is_error: true,
+                    });
+                }
+                return Ok(false);
+            }
+            Ok(true)
+        } else {
+            if let Ok(mut guard) = live_host.write() {
+                guard.pinned_host_key_openssh = Some(presented.clone());
+            }
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(RelayEvent::HostKeyPinned {
+                    host_id,
+                    codename: codename.clone(),
+                    pubkey_openssh: presented,
+                });
+                let _ = tx.send(RelayEvent::AuditLog {
+                    host_id,
+                    codename,
+                    event: "首次绑定主机密钥".to_string(),
+                    detail: "已完成上游 SSH 主机公钥 TOFU 绑定并写入加密仓库".to_string(),
+                    is_error: false,
+                });
+            }
+            Ok(true)
+        }
     }
 }
 
 /// 本地 SSH 服务端处理器（验证 Agent 凭证并将所有通道透明桥接到上游主机）
 struct LocalSshHandler {
-    host: RelayHost,
+    live_host: Arc<RwLock<RelayHost>>,
     live_creds: Arc<RwLock<LiveCredentials>>,
     peer_addr: SocketAddr,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
     active_sessions: Arc<AtomicUsize>,
     total_connections: Arc<AtomicU64>,
     session_counted: bool,
+    upstream_failed: bool,
     upstream: Option<Arc<client::Handle<UpstreamClientHandler>>>,
-    channels: HashMap<ChannelId, ChannelWriteHalf<client::Msg>>,
+    channels: Arc<AsyncMutex<HashMap<ChannelId, ChannelWriteHalf<client::Msg>>>>,
 }
 
 impl LocalSshHandler {
     fn new(
-        host: RelayHost,
+        live_host: Arc<RwLock<RelayHost>>,
         live_creds: Arc<RwLock<LiveCredentials>>,
         peer_addr: SocketAddr,
         event_tx: mpsc::UnboundedSender<RelayEvent>,
@@ -269,122 +377,158 @@ impl LocalSshHandler {
         total_connections: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            host,
+            live_host,
             live_creds,
             peer_addr,
             event_tx,
             active_sessions,
             total_connections,
             session_counted: false,
+            upstream_failed: false,
             upstream: None,
-            channels: HashMap::new(),
+            channels: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
+    fn current_host(&self) -> RelayHost {
+        self.live_host
+            .read()
+            .map(|h| h.clone())
+            .expect("读取运行时主机配置锁失败")
+    }
+
     fn is_valid_agent_user(&self, user: &str) -> bool {
-        user == self.host.codename || user == "agent"
+        self.live_host
+            .read()
+            .map(|h| user == h.codename)
+            .unwrap_or(false)
     }
 
     fn emit_log(&self, event: impl Into<String>, detail: impl Into<String>, is_error: bool) {
-        let _ = self.event_tx.send(RelayEvent::AuditLog {
-            host_id: self.host.id,
-            codename: self.host.codename.clone(),
-            event: event.into(),
-            detail: detail.into(),
-            is_error,
-        });
+        if let Ok(h) = self.live_host.read() {
+            let _ = self.event_tx.send(RelayEvent::AuditLog {
+                host_id: h.id,
+                codename: h.codename.clone(),
+                event: event.into(),
+                detail: detail.into(),
+                is_error,
+            });
+        }
     }
 
     async fn ensure_upstream(&mut self) -> Result<Arc<client::Handle<UpstreamClientHandler>>> {
+        if self.upstream_failed {
+            return Err(anyhow!("上游会话建立已失败"));
+        }
         if let Some(existing) = &self.upstream
             && !existing.is_closed()
         {
             return Ok(existing.clone());
         }
 
-        let tcp_stream = connect_via_proxy(
-            &self.host.proxy,
-            &self.host.real_host,
-            self.host.real_port,
-        )
-        .await?;
+        let host = self.current_host();
+        let live_host_ref = self.live_host.clone();
+        let event_tx = self.event_tx.clone();
 
-        let client_cfg = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(1800)),
-            keepalive_interval: Some(Duration::from_secs(30)),
-            keepalive_max: 6,
-            nodelay: true,
-            ..Default::default()
-        });
+        let connect_fut = async {
+            let tcp_stream =
+                connect_via_proxy(&host.proxy, &host.real_host, host.real_port).await?;
 
-        let mut handle = client::connect_stream(client_cfg, tcp_stream, UpstreamClientHandler)
+            let client_cfg = Arc::new(client::Config {
+                inactivity_timeout: Some(Duration::from_secs(1800)),
+                keepalive_interval: Some(Duration::from_secs(30)),
+                keepalive_max: 6,
+                nodelay: true,
+                ..Default::default()
+            });
+
+            let mut handle = client::connect_stream(
+                client_cfg,
+                tcp_stream,
+                UpstreamClientHandler::new(live_host_ref, event_tx),
+            )
             .await
             .map_err(|e| {
                 anyhow!(
                     "上游 SSH 协议握手失败: {}",
-                    sanitize_error(&e.to_string(), &self.host)
+                    sanitize_error(&e.to_string(), &host)
                 )
             })?;
 
-        let auth_ok = match &self.host.real_auth {
-            RealAuthConfig::Password { password } => handle
-                .authenticate_password(&self.host.real_user, password.clone())
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "上游密码认证请求失败: {}",
-                        sanitize_error(&e.to_string(), &self.host)
-                    )
-                })?
-                .success(),
-            RealAuthConfig::PrivateKey {
-                private_key_pem,
-                passphrase,
-            } => {
-                let decoded_key = decode_secret_key(
-                    private_key_pem,
-                    passphrase.as_deref().filter(|p| !p.is_empty()),
-                )
-                .map_err(|_| anyhow!("解析真实远端私钥失败，请检查私钥格式或口令"))?;
-                let rsa_hash = if decoded_key.algorithm().is_rsa() {
-                    handle
-                        .best_supported_rsa_hash()
-                        .await
-                        .ok()
-                        .flatten()
-                        .flatten()
-                } else {
-                    None
-                };
-                handle
-                    .authenticate_publickey(
-                        &self.host.real_user,
-                        PrivateKeyWithHashAlg::new(Arc::new(decoded_key), rsa_hash),
-                    )
+            let auth_ok = match &host.real_auth {
+                RealAuthConfig::Password { password } => handle
+                    .authenticate_password(&host.real_user, password.clone())
                     .await
                     .map_err(|e| {
                         anyhow!(
-                            "上游私钥认证请求失败: {}",
-                            sanitize_error(&e.to_string(), &self.host)
+                            "上游密码认证请求失败: {}",
+                            sanitize_error(&e.to_string(), &host)
                         )
                     })?
-                    .success()
+                    .success(),
+                RealAuthConfig::PrivateKey {
+                    private_key_pem,
+                    passphrase,
+                } => {
+                    let decoded_key = decode_secret_key(
+                        private_key_pem,
+                        passphrase.as_deref().filter(|p| !p.is_empty()),
+                    )
+                    .map_err(|_| anyhow!("解析真实远端私钥失败，请检查私钥格式或口令"))?;
+                    let rsa_hash = if decoded_key.algorithm().is_rsa() {
+                        handle
+                            .best_supported_rsa_hash()
+                            .await
+                            .ok()
+                            .flatten()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    handle
+                        .authenticate_publickey(
+                            &host.real_user,
+                            PrivateKeyWithHashAlg::new(Arc::new(decoded_key), rsa_hash),
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "上游私钥认证请求失败: {}",
+                                sanitize_error(&e.to_string(), &host)
+                            )
+                        })?
+                        .success()
+                }
+            };
+
+            if !auth_ok {
+                return Err(anyhow!("真实远端服务器拒绝了已保存的认证凭据"));
             }
+
+            Ok(Arc::new(handle))
         };
 
-        if !auth_ok {
-            return Err(anyhow!("真实远端服务器拒绝了已保存的认证凭据"));
+        match timeout(UPSTREAM_HANDSHAKE_TIMEOUT, connect_fut).await {
+            Ok(Ok(shared)) => {
+                self.upstream = Some(shared.clone());
+                Ok(shared)
+            }
+            Ok(Err(e)) => {
+                self.upstream_failed = true;
+                Err(e)
+            }
+            Err(_) => {
+                self.upstream_failed = true;
+                Err(anyhow!("建立上游 SSH 隧道整体握手超时"))
+            }
         }
-
-        let shared = Arc::new(handle);
-        self.upstream = Some(shared.clone());
-        Ok(shared)
     }
 
     fn spawn_upstream_to_local_bridge(
         mut upstream_read: ChannelReadHalf,
         server_handle: server::Handle,
         local_id: ChannelId,
+        channels: Arc<AsyncMutex<HashMap<ChannelId, ChannelWriteHalf<client::Msg>>>>,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = upstream_read.wait().await {
@@ -445,6 +589,7 @@ impl LocalSshHandler {
                     _ => {}
                 }
             }
+            channels.lock().await.remove(&local_id);
         });
     }
 }
@@ -455,11 +600,13 @@ impl Drop for LocalSshHandler {
             let prev = self.active_sessions.fetch_sub(1, Ordering::SeqCst);
             let active = prev.saturating_sub(1);
             let total = self.total_connections.load(Ordering::SeqCst);
-            let _ = self.event_tx.send(RelayEvent::SessionsChanged {
-                host_id: self.host.id,
-                active_sessions: active,
-                total_connections: total,
-            });
+            if let Ok(h) = self.live_host.read() {
+                let _ = self.event_tx.send(RelayEvent::SessionsChanged {
+                    host_id: h.id,
+                    active_sessions: active,
+                    total_connections: total,
+                });
+            }
         }
     }
 }
@@ -577,32 +724,33 @@ impl server::Handler for LocalSshHandler {
     }
 
     async fn auth_succeeded(&mut self, session: &mut ServerSession) -> Result<(), Self::Error> {
+        let host = self.current_host();
         if !self.session_counted {
             self.session_counted = true;
             let active = self.active_sessions.fetch_add(1, Ordering::SeqCst) + 1;
             let total = self.total_connections.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.event_tx.send(RelayEvent::SessionsChanged {
-                host_id: self.host.id,
+                host_id: host.id,
                 active_sessions: active,
                 total_connections: total,
             });
         }
 
         if let Err(err) = self.ensure_upstream().await {
-            let clean_msg = sanitize_error(&err.to_string(), &self.host);
-            self.emit_log("上游连接失败", clean_msg.clone(), true);
+            let clean_msg = sanitize_error(&err.to_string(), &host);
+            self.emit_log("上游连接失败", clean_msg, true);
             let _ = session
                 .handle()
                 .disconnect(
                     Disconnect::ByApplication,
-                    format!("AgentGate upstream relay error: {}", clean_msg),
+                    "AgentGate upstream relay connection failed".to_string(),
                     "en".to_string(),
                 )
                 .await;
         } else {
             self.emit_log(
                 "上游隧道已就绪",
-                format!("已通过 {} 建立加密中转会话", self.host.proxy.badge_text()),
+                format!("已通过 {} 建立加密中转会话", host.proxy.badge_text()),
                 false,
             );
         }
@@ -617,11 +765,12 @@ impl server::Handler for LocalSshHandler {
     ) -> Result<(), Self::Error> {
         let local_id = channel.id();
         drop(channel);
+        let host = self.current_host();
 
         let upstream = match self.ensure_upstream().await {
             Ok(u) => u,
             Err(err) => {
-                let clean = sanitize_error(&err.to_string(), &self.host);
+                let clean = sanitize_error(&err.to_string(), &host);
                 self.emit_log("打开会话通道失败", clean, true);
                 reply.reject(ChannelOpenFailure::ConnectFailed).await;
                 return Ok(());
@@ -632,13 +781,18 @@ impl server::Handler for LocalSshHandler {
             Ok(up_chan) => {
                 reply.accept().await;
                 let (upstream_read, upstream_write) = up_chan.split();
-                self.channels.insert(local_id, upstream_write);
-                Self::spawn_upstream_to_local_bridge(upstream_read, session.handle(), local_id);
+                self.channels.lock().await.insert(local_id, upstream_write);
+                Self::spawn_upstream_to_local_bridge(
+                    upstream_read,
+                    session.handle(),
+                    local_id,
+                    self.channels.clone(),
+                );
             }
             Err(err) => {
                 self.emit_log(
                     "上游会话通道拒绝",
-                    sanitize_error(&err.to_string(), &self.host),
+                    sanitize_error(&err.to_string(), &host),
                     true,
                 );
                 reply
@@ -687,8 +841,13 @@ impl server::Handler for LocalSshHandler {
                 );
                 reply.accept().await;
                 let (upstream_read, upstream_write) = up_chan.split();
-                self.channels.insert(local_id, upstream_write);
-                Self::spawn_upstream_to_local_bridge(upstream_read, session.handle(), local_id);
+                self.channels.lock().await.insert(local_id, upstream_write);
+                Self::spawn_upstream_to_local_bridge(
+                    upstream_read,
+                    session.handle(),
+                    local_id,
+                    self.channels.clone(),
+                );
             }
             Err(_) => {
                 reply.reject(ChannelOpenFailure::ConnectFailed).await;
@@ -708,7 +867,8 @@ impl server::Handler for LocalSshHandler {
         modes: &[(Pty, u32)],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             if up
                 .request_pty(
                     true,
@@ -736,7 +896,8 @@ impl server::Handler for LocalSshHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         self.emit_log("交互终端", "Agent 请求打开交互式 Shell", false);
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             if up.request_shell(true).await.is_err() {
                 let _ = session.channel_failure(channel);
             }
@@ -755,7 +916,8 @@ impl server::Handler for LocalSshHandler {
         let cmd_preview: String = String::from_utf8_lossy(data).chars().take(100).collect();
         self.emit_log("执行命令", format!("exec: {}", cmd_preview), false);
 
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             if up.exec(true, data).await.is_err() {
                 let _ = session.channel_failure(channel);
             }
@@ -772,7 +934,8 @@ impl server::Handler for LocalSshHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         self.emit_log("子系统请求", format!("subsystem: {}", name), false);
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             if up.request_subsystem(true, name).await.is_err() {
                 let _ = session.channel_failure(channel);
             }
@@ -789,7 +952,8 @@ impl server::Handler for LocalSshHandler {
         variable_value: &str,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             if up
                 .set_env(true, variable_name, variable_value)
                 .await
@@ -812,7 +976,8 @@ impl server::Handler for LocalSshHandler {
         pix_height: u32,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             let _ = up
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await;
@@ -826,7 +991,8 @@ impl server::Handler for LocalSshHandler {
         signal: Sig,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             let _ = up.signal(signal).await;
         }
         Ok(())
@@ -838,7 +1004,8 @@ impl server::Handler for LocalSshHandler {
         data: &[u8],
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             let _ = up.data_bytes(Bytes::copy_from_slice(data)).await;
         }
         Ok(())
@@ -851,7 +1018,8 @@ impl server::Handler for LocalSshHandler {
         data: &[u8],
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             let _ = up
                 .extended_data_bytes(code, Bytes::copy_from_slice(data))
                 .await;
@@ -864,7 +1032,8 @@ impl server::Handler for LocalSshHandler {
         channel: ChannelId,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.get(&channel) {
+        let guard = self.channels.lock().await;
+        if let Some(up) = guard.get(&channel) {
             let _ = up.eof().await;
         }
         Ok(())
@@ -875,7 +1044,8 @@ impl server::Handler for LocalSshHandler {
         channel: ChannelId,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        if let Some(up) = self.channels.remove(&channel) {
+        let removed = self.channels.lock().await.remove(&channel);
+        if let Some(up) = removed {
             let _ = up.close().await;
         }
         Ok(())
@@ -888,13 +1058,54 @@ fn sanitize_error(raw: &str, host: &RelayHost) -> String {
     if !host.real_host.is_empty() {
         out = out.replace(&host.real_host, "<redacted-host>");
     }
-    if !host.real_user.is_empty() && host.real_user != host.codename {
+    if !host.real_user.is_empty() {
         out = out.replace(&host.real_user, "<redacted-user>");
     }
-    if let RealAuthConfig::Password { password } = &host.real_auth
-        && !password.is_empty()
-    {
-        out = out.replace(password, "<redacted-secret>");
+    match &host.real_auth {
+        RealAuthConfig::Password { password } => {
+            if !password.is_empty() {
+                out = out.replace(password, "<redacted-secret>");
+            }
+        }
+        RealAuthConfig::PrivateKey {
+            private_key_pem: _,
+            passphrase,
+        } => {
+            if let Some(p) = passphrase.as_deref()
+                && !p.is_empty()
+            {
+                out = out.replace(p, "<redacted-secret>");
+            }
+        }
+    }
+    match &host.proxy {
+        ProxyConfig::None => {}
+        ProxyConfig::Socks5 {
+            host: ph,
+            username,
+            password,
+            ..
+        }
+        | ProxyConfig::HttpConnect {
+            host: ph,
+            username,
+            password,
+            ..
+        } => {
+            if !ph.is_empty() {
+                out = out.replace(ph, "<redacted-proxy>");
+            }
+            if let Some(pu) = username.as_deref()
+                && !pu.is_empty()
+            {
+                out = out.replace(pu, "<redacted-proxy-user>");
+            }
+            if let Some(pw) = password.as_deref()
+                && !pw.is_empty()
+            {
+                out = out.replace(pw, "<redacted-proxy-secret>");
+            }
+        }
     }
     out
 }
@@ -989,6 +1200,7 @@ mod tests {
             proxy: ProxyConfig::None,
             agent_auth_mode: AgentAuthMode::EphemeralPassword,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: RelayHost::now_str(),
             updated_at: RelayHost::now_str(),
         };
@@ -1014,7 +1226,7 @@ mod tests {
         let mut bad_session = client::connect(
             client_cfg.clone(),
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect local relay");
@@ -1027,7 +1239,7 @@ mod tests {
         let mut good_session = client::connect(
             client_cfg.clone(),
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect local relay 2");
@@ -1074,7 +1286,7 @@ mod tests {
         let mut key_session = client::connect(
             client_cfg,
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect local relay with key");
@@ -1115,21 +1327,31 @@ mod tests {
             real_auth: RealAuthConfig::Password {
                 password: "UltraSecretProdPwd!2026".to_string(),
             },
-            proxy: ProxyConfig::None,
+            proxy: ProxyConfig::Socks5 {
+                host: "10.0.99.88".to_string(),
+                port: 1080,
+                username: Some("corp_socks_u".to_string()),
+                password: Some("corp_socks_p".to_string()),
+            },
             agent_auth_mode: AgentAuthMode::EphemeralPassword,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: RelayHost::now_str(),
             updated_at: RelayHost::now_str(),
         };
         let raw_err =
-            "Failed to authenticate prod_super_admin@10.96.1.104 with UltraSecretProdPwd!2026";
+            "Failed to authenticate prod_super_admin@10.96.1.104 via proxy corp_socks_u:corp_socks_p@10.0.99.88 with UltraSecretProdPwd!2026";
         let sanitized = sanitize_error(raw_err, &host);
         assert!(!sanitized.contains("10.96.1.104"));
         assert!(!sanitized.contains("prod_super_admin"));
         assert!(!sanitized.contains("UltraSecretProdPwd!2026"));
+        assert!(!sanitized.contains("10.0.99.88"));
+        assert!(!sanitized.contains("corp_socks_u"));
+        assert!(!sanitized.contains("corp_socks_p"));
         assert!(sanitized.contains("<redacted-host>"));
         assert!(sanitized.contains("<redacted-user>"));
         assert!(sanitized.contains("<redacted-secret>"));
+        assert!(sanitized.contains("<redacted-proxy>"));
 
         // 2. 验证真实用户名无法登录本地中转端口，以及临时密码热轮换后旧密码立即失效
         let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
@@ -1158,6 +1380,7 @@ mod tests {
         let mut relay_host = host.clone();
         relay_host.real_host = "127.0.0.1".to_string();
         relay_host.real_port = remote_port;
+        relay_host.proxy = ProxyConfig::None;
 
         let pwd_v1 = RelayHost::generate_ephemeral_password();
         let pwd_v2 = RelayHost::generate_ephemeral_password();
@@ -1180,7 +1403,7 @@ mod tests {
         let mut wrong_user_sess = client::connect(
             client_cfg.clone(),
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect wrong user");
@@ -1189,6 +1412,20 @@ mod tests {
             .await
             .expect("auth wrong user");
         assert!(!wrong_user_auth.success());
+
+        // 使用通用用户名 agent + 正确的临时密码，同样必须被拒绝（仅允许唯一 codename）
+        let mut agent_user_sess = client::connect(
+            client_cfg.clone(),
+            ("127.0.0.1", control.local_port),
+            UpstreamClientHandler::permissive_for_test(),
+        )
+        .await
+        .expect("connect agent user");
+        let agent_user_auth = agent_user_sess
+            .authenticate_password("agent", &pwd_v1)
+            .await
+            .expect("auth agent user");
+        assert!(!agent_user_auth.success());
 
         // 热轮换临时密码为 pwd_v2
         control.update_credentials(LiveCredentials {
@@ -1201,7 +1438,7 @@ mod tests {
         let mut old_pwd_sess = client::connect(
             client_cfg.clone(),
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect old pwd");
@@ -1215,7 +1452,7 @@ mod tests {
         let mut new_pwd_sess = client::connect(
             client_cfg,
             ("127.0.0.1", control.local_port),
-            UpstreamClientHandler,
+            UpstreamClientHandler::permissive_for_test(),
         )
         .await
         .expect("connect new pwd");
@@ -1321,6 +1558,7 @@ mod tests {
             },
             agent_auth_mode: AgentAuthMode::DedicatedKey,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: RelayHost::now_str(),
             updated_at: RelayHost::now_str(),
         };
@@ -1379,6 +1617,134 @@ mod tests {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, "REMOTE_EXEC_OK:hostname && id\n");
+
+        control.stop();
+    }
+
+    #[tokio::test]
+    async fn test_upstream_host_key_tofu_pinning_and_mitm_rejection() {
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
+        let remote_port = remote_listener.local_addr().expect("remote addr").port();
+        let legitimate_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("legit key");
+        let expected_pubkey_openssh = legitimate_key
+            .public_key()
+            .to_openssh()
+            .expect("legit pubkey openssh");
+
+        let remote_cfg = Arc::new(server::Config {
+            keys: vec![legitimate_key],
+            auth_rejection_time: Duration::from_millis(10),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = remote_listener.accept().await {
+                let cfg = remote_cfg.clone();
+                tokio::spawn(async move {
+                    let handler = MockRemoteSshServer {
+                        expected_user: "root".to_string(),
+                        expected_password: "RootPass!2026".to_string(),
+                    };
+                    let _ = server::run_stream(cfg, socket, handler).await;
+                });
+            }
+        });
+
+        let host = RelayHost {
+            id: Uuid::new_v4(),
+            codename: "tofu-guard-01".to_string(),
+            label: "TOFU 测试节点".to_string(),
+            real_host: "127.0.0.1".to_string(),
+            real_port: remote_port,
+            real_user: "root".to_string(),
+            real_auth: RealAuthConfig::Password {
+                password: "RootPass!2026".to_string(),
+            },
+            proxy: ProxyConfig::None,
+            agent_auth_mode: AgentAuthMode::EphemeralPassword,
+            dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
+            created_at: RelayHost::now_str(),
+            updated_at: RelayHost::now_str(),
+        };
+
+        let temp_pwd = RelayHost::generate_ephemeral_password();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let control = start_host_relay(
+            host.clone(),
+            LiveCredentials {
+                mode: AgentAuthMode::EphemeralPassword,
+                temp_password: Some(temp_pwd.clone()),
+                dedicated_pubkey: None,
+            },
+            event_tx,
+        )
+        .await
+        .expect("start relay");
+
+        let client_cfg = Arc::new(client::Config::default());
+        let mut sess1 = client::connect(
+            client_cfg.clone(),
+            ("127.0.0.1", control.local_port),
+            UpstreamClientHandler::permissive_for_test(),
+        )
+        .await
+        .expect("connect 1");
+        let auth1 = sess1
+            .authenticate_password("tofu-guard-01", &temp_pwd)
+            .await
+            .expect("auth 1");
+        assert!(auth1.success());
+        let mut chan1 = sess1.channel_open_session().await.expect("open chan 1");
+        chan1.exec(true, b"echo tofu").await.expect("exec 1");
+        while let Some(msg) = chan1.wait().await {
+            if matches!(msg, ChannelMsg::Close) {
+                break;
+            }
+        }
+
+        // 验证首次连接已自动绑定远端主机公钥并通过事件发出
+        let pinned_in_live = control
+            .live_host
+            .read()
+            .expect("read live_host")
+            .pinned_host_key_openssh
+            .clone();
+        assert_eq!(pinned_in_live.as_deref(), Some(expected_pubkey_openssh.as_str()));
+
+        let mut saw_pin_event = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let RelayEvent::HostKeyPinned { pubkey_openssh, .. } = ev {
+                assert_eq!(pubkey_openssh, expected_pubkey_openssh);
+                saw_pin_event = true;
+            }
+        }
+        assert!(saw_pin_event, "应当触发 HostKeyPinned 事件");
+
+        // 篡改已绑定的主机公钥为另一把伪造密钥，验证下次连接被 check_server_key 阻断
+        let fake_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("fake key");
+        let mut tampered_host = control.live_host.read().expect("read").clone();
+        tampered_host.pinned_host_key_openssh =
+            Some(fake_key.public_key().to_openssh().expect("fake openssh"));
+        control.update_host(tampered_host);
+
+        let mut sess2 = client::connect(
+            client_cfg,
+            ("127.0.0.1", control.local_port),
+            UpstreamClientHandler::permissive_for_test(),
+        )
+        .await
+        .expect("connect 2");
+        let _ = sess2
+            .authenticate_password("tofu-guard-01", &temp_pwd)
+            .await;
+        let chan2_res = sess2.channel_open_session().await;
+        assert!(
+            chan2_res.is_err(),
+            "当远端主机公钥与已绑定指纹不匹配时，必须拒绝建立会话通道"
+        );
 
         control.stop();
     }

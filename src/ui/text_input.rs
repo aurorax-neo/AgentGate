@@ -210,34 +210,42 @@ impl TextField {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() && !self.is_masked {
+            let start = self.clamp_to_char_boundary(self.selected_range.start);
+            let end = self.clamp_to_char_boundary(self.selected_range.end);
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[start..end].to_string(),
             ));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() && !self.is_masked {
+            let start = self.clamp_to_char_boundary(self.selected_range.start);
+            let end = self.clamp_to_char_boundary(self.selected_range.end);
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[start..end].to_string(),
             ));
             self.replace_text_in_range(None, "", window, cx);
         }
     }
 
+    fn clamp_to_char_boundary(&self, offset: usize) -> usize {
+        clamp_utf8_boundary(&self.content, offset)
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let clamped = offset.min(self.content.len());
+        let clamped = self.clamp_to_char_boundary(offset);
         self.selected_range = clamped..clamped;
         cx.notify();
     }
 
     fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
+        let raw = if self.selection_reversed {
             self.selected_range.start
         } else {
             self.selected_range.end
-        }
-        .min(self.content.len())
+        };
+        self.clamp_to_char_boundary(raw)
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -254,12 +262,12 @@ impl TextField {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
-            .min(self.content.len())
+        let raw = line.closest_index_for_x(position.x - bounds.left());
+        self.clamp_to_char_boundary(raw)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = offset.min(self.content.len());
+        let offset = self.clamp_to_char_boundary(offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -384,11 +392,13 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let start = self.clamp_to_char_boundary(range.start);
+        let end = self.clamp_to_char_boundary(range.end).max(start);
 
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..start].to_owned() + new_text + &self.content[end..])
                 .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selected_range = start + new_text.len()..start + new_text.len();
         self.marked_range.take();
         cx.notify();
     }
@@ -406,20 +416,26 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let start = self.clamp_to_char_boundary(range.start);
+        let end = self.clamp_to_char_boundary(range.end).max(start);
 
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..start].to_owned() + new_text + &self.content[end..])
                 .into();
         if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
+            self.marked_range = Some(start..start + new_text.len());
         } else {
             self.marked_range = None;
         }
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            .map(|new_range| {
+                let s = self.clamp_to_char_boundary(start + new_range.start);
+                let e = self.clamp_to_char_boundary(start + new_range.end).max(s);
+                s..e
+            })
+            .unwrap_or_else(|| start + new_text.len()..start + new_text.len());
 
         cx.notify();
     }
@@ -696,5 +712,35 @@ impl Render for TextField {
 impl Focusable for TextField {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// 将任意字节偏移安全向下对齐到有效的 UTF-8 字符边界
+pub fn clamp_utf8_boundary(text: &str, offset: usize) -> usize {
+    text.floor_char_boundary(offset.min(text.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clamp_utf8_boundary_on_multibyte_masked_text() {
+        let s = "密a码"; // '密' (0..3), 'a' (3..4), '码' (4..7)
+        assert_eq!(clamp_utf8_boundary(s, 0), 0);
+        assert_eq!(clamp_utf8_boundary(s, 1), 0);
+        assert_eq!(clamp_utf8_boundary(s, 2), 0);
+        assert_eq!(clamp_utf8_boundary(s, 3), 3);
+        assert_eq!(clamp_utf8_boundary(s, 4), 4);
+        assert_eq!(clamp_utf8_boundary(s, 5), 4);
+        assert_eq!(clamp_utf8_boundary(s, 6), 4);
+        assert_eq!(clamp_utf8_boundary(s, 7), 7);
+        assert_eq!(clamp_utf8_boundary(s, 99), 7);
+        // 验证任意偏移切片均不会触发 UTF-8 字符边界 panic
+        for raw_idx in 0..=10 {
+            let idx = clamp_utf8_boundary(s, raw_idx);
+            let _ = &s[..idx];
+            let _ = &s[idx..];
+        }
     }
 }

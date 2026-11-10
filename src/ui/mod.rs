@@ -248,12 +248,18 @@ impl AgentGateWorkbench {
                             TrayCommand::ToggleWindow => {
                                 let next = !is_window_visible();
                                 platform_set_window_visible(next);
+                                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                Self::sync_linux_gpui_window_visibility(next, cx);
                             }
                             TrayCommand::ShowWindow => {
                                 platform_set_window_visible(true);
+                                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                Self::sync_linux_gpui_window_visibility(true, cx);
                             }
                             TrayCommand::HideWindow => {
                                 platform_set_window_visible(false);
+                                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                Self::sync_linux_gpui_window_visibility(false, cx);
                             }
                             TrayCommand::QuitApp => {
                                 cx.quit();
@@ -294,7 +300,23 @@ impl AgentGateWorkbench {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn sync_linux_gpui_window_visibility(visible: bool, cx: &mut App) {
+        for handle in cx.windows() {
+            let _ = handle.update(cx, |_, window, _| {
+                if visible {
+                    window.activate_window();
+                } else {
+                    window.minimize_window();
+                }
+            });
+        }
+    }
+
     fn apply_optional_demo_seed(&mut self, cx: &mut Context<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         if std::env::var("AGENTGATE_DEMO_SEED").as_deref() != Ok("1") {
             return;
         }
@@ -318,6 +340,7 @@ impl AgentGateWorkbench {
                 },
                 agent_auth_mode: AgentAuthMode::EphemeralPassword,
                 dedicated_key_openssh_pem: None,
+                pinned_host_key_openssh: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
@@ -339,6 +362,7 @@ impl AgentGateWorkbench {
                 },
                 agent_auth_mode: AgentAuthMode::DedicatedKey,
                 dedicated_key_openssh_pem: None,
+                pinned_host_key_openssh: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
@@ -355,6 +379,7 @@ impl AgentGateWorkbench {
                 proxy: ProxyConfig::None,
                 agent_auth_mode: AgentAuthMode::EphemeralPassword,
                 dedicated_key_openssh_pem: None,
+                pinned_host_key_openssh: None,
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -489,7 +514,18 @@ impl AgentGateWorkbench {
                     false,
                 ));
             }
-            RelayEvent::Stopped { host_id, codename } => {
+            RelayEvent::Stopped {
+                host_id,
+                codename,
+                local_port,
+            } => {
+                if self
+                    .controls
+                    .get(&host_id)
+                    .is_some_and(|ctrl| ctrl.local_port != local_port)
+                {
+                    return;
+                }
                 let rt = self.runtimes.entry(host_id).or_default();
                 rt.status = RelayStatus::Stopped;
                 self.controls.remove(&host_id);
@@ -509,6 +545,16 @@ impl AgentGateWorkbench {
                 }
                 rt.total_connections = total_connections;
             }
+            RelayEvent::HostKeyPinned {
+                host_id,
+                codename: _,
+                pubkey_openssh,
+            } => {
+                if let Some(host) = self.hosts.iter_mut().find(|h| h.id == host_id) {
+                    host.pinned_host_key_openssh = Some(pubkey_openssh);
+                    let _ = self.storage.save_hosts(&self.hosts);
+                }
+            }
             RelayEvent::AuditLog {
                 host_id,
                 codename,
@@ -522,8 +568,16 @@ impl AgentGateWorkbench {
             RelayEvent::Error {
                 host_id,
                 codename,
+                local_port,
                 message,
             } => {
+                if self
+                    .controls
+                    .get(&host_id)
+                    .is_some_and(|ctrl| ctrl.local_port != local_port)
+                {
+                    return;
+                }
                 let rt = self.runtimes.entry(host_id).or_default();
                 rt.status = RelayStatus::Error(message.clone());
                 rt.push_log(&codename, "服务异常", message.clone(), true);
@@ -652,6 +706,9 @@ impl AgentGateWorkbench {
         {
             return Err("机器代号仅允许包含字母、数字、连字符(-)或下划线(_)".to_string());
         }
+        if codename.eq_ignore_ascii_case("agent") {
+            return Err("不允许使用通用保留名 `agent` 作为代号，请使用可区分的唯一代号".to_string());
+        }
         let is_new = self.editing_host_id.is_none();
         let id = self.editing_host_id.unwrap_or_else(Uuid::new_v4);
         if self
@@ -679,6 +736,9 @@ impl AgentGateWorkbench {
         let real_user = self.form_real_user.read(cx).text().trim().to_string();
         if real_user.is_empty() {
             return Err("真实远端登录用户名不能为空".to_string());
+        }
+        if codename.eq_ignore_ascii_case(&real_user) {
+            return Err("为保障身份隔离，机器代号 (Codename) 不能与真实远端用户名相同".to_string());
         }
 
         let secret = self.form_real_secret.read(cx).text();
@@ -736,6 +796,13 @@ impl AgentGateWorkbench {
         };
 
         let existing = self.hosts.iter().find(|h| h.id == id);
+        let pinned_host_key_openssh = existing.and_then(|h| {
+            if h.real_host == real_host && h.real_port == real_port {
+                h.pinned_host_key_openssh.clone()
+            } else {
+                None
+            }
+        });
         let now = RelayHost::now_str();
         let host = RelayHost {
             id,
@@ -748,6 +815,7 @@ impl AgentGateWorkbench {
             proxy,
             agent_auth_mode: self.form_agent_auth_mode,
             dedicated_key_openssh_pem: existing.and_then(|h| h.dedicated_key_openssh_pem.clone()),
+            pinned_host_key_openssh,
             created_at: existing
                 .map(|h| h.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
@@ -850,8 +918,8 @@ impl AgentGateWorkbench {
                 }
                 if let Some(rt) = self.runtimes.get_mut(&id) {
                     rt.status = RelayStatus::Stopped;
-                    // 停止后自动更换下次启动的临时密码
-                    rt.current_temp_password = Some(RelayHost::generate_ephemeral_password());
+                    // 停止后擦除旧临时密码并生成下次启动的新密码
+                    rt.rotate_or_clear_temp_password(Some(RelayHost::generate_ephemeral_password()));
                 }
                 self.status_banner = Some((
                     format!("已停止代号 [{}] 在 127.0.0.1:{} 的中转服务", codename, local_port),
@@ -865,7 +933,9 @@ impl AgentGateWorkbench {
                 for rt in self.runtimes.values_mut() {
                     if rt.status.is_running() {
                         rt.status = RelayStatus::Stopped;
-                        rt.current_temp_password = Some(RelayHost::generate_ephemeral_password());
+                        rt.rotate_or_clear_temp_password(Some(
+                            RelayHost::generate_ephemeral_password(),
+                        ));
                     }
                 }
                 self.status_banner = Some((
@@ -874,6 +944,15 @@ impl AgentGateWorkbench {
                 ));
             }
             PendingAction::SaveHost { mut host, is_new } => {
+                let old_codename = if !is_new {
+                    self.hosts
+                        .iter()
+                        .find(|h| h.id == host.id)
+                        .map(|h| h.codename.clone())
+                } else {
+                    None
+                };
+
                 let (key_path, pubkey) = match self
                     .storage
                     .ensure_dedicated_agent_key(&mut host, false)
@@ -886,6 +965,12 @@ impl AgentGateWorkbench {
                         return;
                     }
                 };
+
+                if let Some(prev_name) = old_codename
+                    && prev_name != host.codename
+                {
+                    self.storage.remove_dedicated_key_file(&prev_name);
+                }
 
                 let id = host.id;
                 let codename = host.codename.clone();
@@ -921,6 +1006,7 @@ impl AgentGateWorkbench {
 
                 if let Some(ctrl) = self.controls.get(&id) {
                     let creds = Self::build_live_credentials(&host, rt);
+                    ctrl.update_host((*host).clone());
                     ctrl.update_credentials(creds);
                 }
 
@@ -954,7 +1040,7 @@ impl AgentGateWorkbench {
                     AgentAuthMode::EphemeralPassword => {
                         let new_pwd = RelayHost::generate_ephemeral_password();
                         if let Some(rt) = self.runtimes.get_mut(&id) {
-                            rt.current_temp_password = Some(new_pwd);
+                            rt.rotate_or_clear_temp_password(Some(new_pwd));
                             rt.push_log(&codename, "轮换临时密码", "已生成新 24 位临时密码，旧密码已失效", false);
                         }
                     }
@@ -1166,8 +1252,12 @@ impl AgentGateWorkbench {
                             true,
                             false,
                         )
-                        .on_click(cx.listener(|_, _, _, _| {
+                        .on_click(cx.listener(|_, _, window, _| {
                             platform_set_window_visible(false);
+                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                            window.minimize_window();
+                            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                            let _ = window;
                         })),
                     ),
             )
@@ -2447,7 +2537,7 @@ impl AgentGateWorkbench {
                 }
             }
         }
-        all_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        all_logs.sort_by(|a, b| b.seq.cmp(&a.seq));
 
         div()
             .p_4()
@@ -2658,8 +2748,12 @@ impl Render for AgentGateWorkbench {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_confirm_modal_action))
             .on_action(cx.listener(Self::on_cancel_modal_action))
-            .on_action(|_: &HideToTrayAction, _window: &mut Window, _cx: &mut App| {
+            .on_action(|_: &HideToTrayAction, window: &mut Window, _cx: &mut App| {
                 platform_set_window_visible(false);
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                window.minimize_window();
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                let _ = window;
             })
             .on_action(|_: &NextFieldTab, window: &mut Window, _cx: &mut App| {
                 window.focus_next();

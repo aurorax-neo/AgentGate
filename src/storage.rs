@@ -13,6 +13,16 @@ const VAULT_MAGIC: &[u8; 8] = b"AGTVLT01";
 const NONCE_LEN: usize = 12;
 const MASTER_KEY_LEN: usize = 32;
 
+#[inline]
+fn zeroize_slice(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VaultPayload {
     pub version: u32,
@@ -71,9 +81,10 @@ impl EncryptedStorage {
     fn load_or_create_master_key(&self) -> Result<[u8; MASTER_KEY_LEN]> {
         let key_path = self.master_key_path();
         if key_path.exists() {
-            let bytes = fs::read(&key_path)
+            let mut bytes = fs::read(&key_path)
                 .with_context(|| format!("读取本机主密钥失败: {}", key_path.display()))?;
             if bytes.len() != MASTER_KEY_LEN {
+                zeroize_slice(&mut bytes);
                 return Err(anyhow!(
                     "主密钥长度异常（期望 {} 字节，实际 {} 字节）",
                     MASTER_KEY_LEN,
@@ -82,6 +93,7 @@ impl EncryptedStorage {
             }
             let mut key = [0u8; MASTER_KEY_LEN];
             key.copy_from_slice(&bytes);
+            zeroize_slice(&mut bytes);
             return Ok(key);
         }
 
@@ -95,9 +107,10 @@ impl EncryptedStorage {
 
     /// 使用 AES-256-GCM 加密保存全部主机配置到 vault.enc
     pub fn save_hosts(&self, hosts: &[RelayHost]) -> Result<()> {
-        let key_bytes = self.load_or_create_master_key()?;
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|_| anyhow!("初始化 AES-256-GCM 密钥失败"))?;
+        let mut key_bytes = self.load_or_create_master_key()?;
+        let unbound_res = UnboundKey::new(&AES_256_GCM, &key_bytes);
+        zeroize_slice(&mut key_bytes);
+        let unbound_key = unbound_res.map_err(|_| anyhow!("初始化 AES-256-GCM 密钥失败"))?;
         let key = LessSafeKey::new(unbound_key);
 
         let payload = VaultPayload {
@@ -148,9 +161,10 @@ impl EncryptedStorage {
         nonce_bytes.copy_from_slice(&raw[VAULT_MAGIC.len()..header_len]);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        let key_bytes = self.load_or_create_master_key()?;
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|_| anyhow!("初始化 AES-256-GCM 密钥失败"))?;
+        let mut key_bytes = self.load_or_create_master_key()?;
+        let unbound_res = UnboundKey::new(&AES_256_GCM, &key_bytes);
+        zeroize_slice(&mut key_bytes);
+        let unbound_key = unbound_res.map_err(|_| anyhow!("初始化 AES-256-GCM 密钥失败"))?;
         let key = LessSafeKey::new(unbound_key);
 
         let mut ciphertext = raw[header_len..].to_vec();
@@ -158,8 +172,10 @@ impl EncryptedStorage {
             .open_in_place(nonce, Aad::from(VAULT_MAGIC), &mut ciphertext)
             .map_err(|_| anyhow!("解密 vault.enc 失败：密文已被篡改或主密钥不匹配"))?;
 
-        let payload: VaultPayload =
-            serde_json::from_slice(plaintext).context("反序列化加密仓库内容失败")?;
+        let parse_res: Result<VaultPayload> =
+            serde_json::from_slice(plaintext).context("反序列化加密仓库内容失败");
+        zeroize_slice(&mut ciphertext);
+        let payload = parse_res?;
         Ok(payload.hosts)
     }
 
@@ -244,8 +260,16 @@ fn set_file_permissions_0600(_path: &Path) -> Result<()> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string());
-        let grant_arg = format!("{}:(F)", user);
+        let principal = std::env::var("USERNAME")
+            .ok()
+            .filter(|u| {
+                !u.is_empty()
+                    && !u
+                        .chars()
+                        .any(|c| matches!(c, ':' | '/' | '\\' | '"' | '\r' | '\n') || c.is_control())
+            })
+            .unwrap_or_else(|| "*S-1-5-32-544".to_string());
+        let grant_arg = format!("{}:(F)", principal);
         let _ = std::process::Command::new("icacls")
             .arg(_path)
             .args(["/inheritance:r", "/grant:r", &grant_arg])
@@ -269,8 +293,16 @@ fn set_dir_permissions_0700(_path: &Path) -> Result<()> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string());
-        let grant_arg = format!("{}:(OI)(CI)(F)", user);
+        let principal = std::env::var("USERNAME")
+            .ok()
+            .filter(|u| {
+                !u.is_empty()
+                    && !u
+                        .chars()
+                        .any(|c| matches!(c, ':' | '/' | '\\' | '"' | '\r' | '\n') || c.is_control())
+            })
+            .unwrap_or_else(|| "*S-1-5-32-544".to_string());
+        let grant_arg = format!("{}:(OI)(CI)(F)", principal);
         let _ = std::process::Command::new("icacls")
             .arg(_path)
             .args(["/inheritance:r", "/grant:r", &grant_arg])
@@ -309,6 +341,7 @@ mod tests {
             },
             agent_auth_mode: AgentAuthMode::DedicatedKey,
             dedicated_key_openssh_pem: None,
+            pinned_host_key_openssh: None,
             created_at: "2026-11-10 10:00:00".to_string(),
             updated_at: "2026-11-10 10:00:00".to_string(),
         };
