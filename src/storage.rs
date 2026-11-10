@@ -244,10 +244,11 @@ fn set_file_permissions_0600(_path: &Path) -> Result<()> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // 使用 Windows 通用 Owner SID (*S-1-3-4) 移除继承并仅授予文件所有者完全控制权，满足 Windows OpenSSH 私钥权限检查
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string());
+        let grant_arg = format!("{}:(F)", user);
         let _ = std::process::Command::new("icacls")
             .arg(_path)
-            .args(["/inheritance:r", "/grant:r", "*S-1-3-4:(F)"])
+            .args(["/inheritance:r", "/grant:r", &grant_arg])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
@@ -268,9 +269,11 @@ fn set_dir_permissions_0700(_path: &Path) -> Result<()> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string());
+        let grant_arg = format!("{}:(OI)(CI)(F)", user);
         let _ = std::process::Command::new("icacls")
             .arg(_path)
-            .args(["/inheritance:r", "/grant:r", "*S-1-3-4:(OI)(CI)(F)"])
+            .args(["/inheritance:r", "/grant:r", &grant_arg])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
     }

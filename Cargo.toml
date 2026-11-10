@@ -44,3 +44,6 @@ ksni = "0.3"
 
 [dev-dependencies]
 tempfile = "3.14"
+
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
