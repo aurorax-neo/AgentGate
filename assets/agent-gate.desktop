@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AgentGate
+GenericName=SSH Relay Workbench
+Comment=Local SSH Isolation Relay Workbench for AI Agents
+Exec=/usr/bin/agent-gate
+Icon=agent-gate
+Terminal=false
+Categories=Development;Network;Security;Utility;
+StartupNotify=false

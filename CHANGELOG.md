@@ -15,4 +15,4 @@
 - 支持 macOS / Windows / Linux 三端菜单栏或系统托盘常驻运行，隐藏 Dock 与任务栏图标，全操作强制内置模态框二次确认
 
 ### 🧰 Maintenance
-- 接入符合工程规范的多架构二进制构建与 GitHub Release 自动化发布流水线（SemVer Tag、Cargo.toml 版本与 CHANGELOG 强一致校验）
+- 接入符合工程规范的多架构桌面安装包构建与 GitHub Release 自动化发布流水线（产出 macOS `.dmg` / `AgentGate.app`、Windows `-setup.exe` / `.zip`、Linux `.deb` / `.tar.gz`，含 SemVer Tag、Cargo.toml 版本与 CHANGELOG 强一致校验）

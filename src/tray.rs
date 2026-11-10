@@ -249,6 +249,109 @@ pub fn export_icon_design_showcase(output_path: &Path) -> Result<()> {
         .with_context(|| format!("保存图标预览图失败: {}", output_path.display()))
 }
 
+/// 生成指定尺寸 (如 16..=1024) 的桌面应用圆角图标 RGBA 缓冲区（透明圆角外框 + 深青蓝渐变底座 + 纯白双弧隔离核）
+pub fn render_app_icon_image(size: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let mut img = ImageBuffer::from_pixel(size, size, Rgba([0, 0, 0, 0]));
+    let fsize = size as f32;
+    let half = fsize * 0.5;
+    let pad = fsize * 0.06;
+    let inner_half = half - pad;
+    let corner_r = fsize * 0.21;
+    let box_extent = inner_half - corner_r;
+    let aa_width = 0.85_f32;
+
+    let glyph_pad = fsize * 0.18;
+    let glyph_span = (fsize - glyph_pad * 2.0).max(1.0);
+
+    for py in 0..size {
+        for px in 0..size {
+            let dx = (px as f32 + 0.5 - half).abs() - box_extent;
+            let dy = (py as f32 + 0.5 - half).abs() - box_extent;
+            let sdf = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt() + dx.max(dy).min(0.0) - corner_r;
+            if sdf <= aa_width {
+                let mask_a = ((aa_width - sdf) / (2.0 * aa_width)).clamp(0.0, 1.0);
+                let grad_t = (py as f32) / fsize;
+                let bg_r = 14.0 * (1.0 - grad_t) + 8.0 * grad_t;
+                let bg_g = 118.0 * (1.0 - grad_t) + 68.0 * grad_t;
+                let bg_b = 172.0 * (1.0 - grad_t) + 122.0 * grad_t;
+
+                let mut hits = 0u32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let gx = (px as f32 + (sx as f32 + 0.5) * 0.25 - glyph_pad) / glyph_span;
+                        let gy = (py as f32 + (sy as f32 + 0.5) * 0.25 - glyph_pad) / glyph_span;
+                        if (0.0..=1.0).contains(&gx) && (0.0..=1.0).contains(&gy) {
+                            let nx = gx * 2.0 - 1.0;
+                            let ny = 1.0 - gy * 2.0;
+                            if sample_gate_icon_point(nx, ny) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+                let icon_a = (hits as f32) / 16.0;
+                let r = (bg_r * (1.0 - icon_a) + 246.0 * icon_a).round() as u8;
+                let g = (bg_g * (1.0 - icon_a) + 250.0 * icon_a).round() as u8;
+                let b = (bg_b * (1.0 - icon_a) + 255.0 * icon_a).round() as u8;
+                let a = (mask_a * 255.0).round() as u8;
+                img.put_pixel(px, py, Rgba([r, g, b, a]));
+            }
+        }
+    }
+    img
+}
+
+/// 导出指定尺寸的桌面应用图标 PNG
+pub fn export_app_icon_png(size: u32, output_path: &Path) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let img = render_app_icon_image(size);
+    img.save(output_path)
+        .with_context(|| format!("导出应用图标失败: {}", output_path.display()))
+}
+
+/// 导出包含 256/64/32/16 多分辨率 PNG 帧的 Windows `.ico` 图标文件
+pub fn export_app_icon_ico(output_path: &Path) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let sizes = [256u32, 64, 32, 16];
+    let mut png_blobs = Vec::with_capacity(sizes.len());
+    for &sz in &sizes {
+        let img = render_app_icon_image(sz);
+        let mut cur = Cursor::new(Vec::new());
+        img.write_to(&mut cur, ImageFormat::Png)?;
+        png_blobs.push((sz, cur.into_inner()));
+    }
+
+    let count = png_blobs.len() as u16;
+    let mut ico = Vec::new();
+    // ICONDIR header (6 bytes)
+    ico.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    ico.extend_from_slice(&1u16.to_le_bytes()); // Type = 1 (ICON)
+    ico.extend_from_slice(&count.to_le_bytes());
+
+    let mut data_offset = 6u32 + (count as u32) * 16;
+    for (sz, blob) in &png_blobs {
+        let dim_byte = if *sz >= 256 { 0u8 } else { *sz as u8 };
+        ico.push(dim_byte); // bWidth
+        ico.push(dim_byte); // bHeight
+        ico.push(0);        // bColorCount
+        ico.push(0);        // bReserved
+        ico.extend_from_slice(&1u16.to_le_bytes()); // wPlanes
+        ico.extend_from_slice(&32u16.to_le_bytes()); // wBitCount
+        ico.extend_from_slice(&(blob.len() as u32).to_le_bytes()); // dwBytesInRes
+        ico.extend_from_slice(&data_offset.to_le_bytes()); // dwImageOffset
+        data_offset += blob.len() as u32;
+    }
+    for (_, blob) in &png_blobs {
+        ico.extend_from_slice(blob);
+    }
+    std::fs::write(output_path, ico)
+        .with_context(|| format!("写入 Windows ICO 图标失败: {}", output_path.display()))
+}
+
 /// 初始化当前平台的菜单栏/系统托盘图标，并隐藏 Dock / 任务栏图标
 pub fn init_platform_tray_and_hide_dock() {
     let _ = ensure_tray_channel();

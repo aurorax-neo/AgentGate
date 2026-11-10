@@ -91,25 +91,84 @@ jobs:
         run: |
           TAG_NAME="${{ inputs.tag || github.ref_name }}"
           [ "$TAG_NAME" = "" ] || [ "$TAG_NAME" = "main" ] && TAG_NAME="dev"
-          PKG_NAME="agent-gate_${TAG_NAME}_${{ matrix.target }}"
+          VER="${TAG_NAME#v}"
+          PKG_NAME="AgentGate_${TAG_NAME}_${{ matrix.target }}"
           ROOT_DIR="$(pwd)"
-          mkdir -p "${ROOT_DIR}/release-packages" release-pkg
+          mkdir -p "${ROOT_DIR}/release-packages"
 
-          BIN_NAME="agent-gate"
-          EXT=""
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            EXT=".exe"
-          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS: 组装标准 AgentGate.app 应用包并封装为可拖拽安装的 .dmg 磁盘映像
+            DMG_STAGE="${ROOT_DIR}/dmg-staging"
+            APP_BUNDLE="${DMG_STAGE}/AgentGate.app"
+            mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
 
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}${EXT}" "release-pkg/${BIN_NAME}${EXT}"
-          cp README.md release-pkg/ 2>/dev/null || true
-          cp CHANGELOG.md release-pkg/ 2>/dev/null || true
-          cp LICENSE release-pkg/ 2>/dev/null || true
+            cp "target/${{ matrix.target }}/release/agent-gate" "${APP_BUNDLE}/Contents/MacOS/agent-gate"
+            chmod +x "${APP_BUNDLE}/Contents/MacOS/agent-gate"
+            cp "assets/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+            cp "assets/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 
-          if [ "${{ runner.os }}" = "Windows" ]; then
+            codesign --force --deep --sign - "${APP_BUNDLE}"
+            ln -s /Applications "${DMG_STAGE}/Applications"
+
+            hdiutil create \
+              -volname "AgentGate" \
+              -srcfolder "${DMG_STAGE}" \
+              -ov -format UDZO \
+              "${ROOT_DIR}/release-packages/${PKG_NAME}.dmg"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # Windows: 生成内嵌图标的无控制台 AgentGate.exe，产出 NSIS 安装包 (-setup.exe) 与便携版 (.zip)
+            mkdir -p release-pkg
+            cp "target/${{ matrix.target }}/release/agent-gate.exe" "release-pkg/AgentGate.exe"
+            cp "target/${{ matrix.target }}/release/agent-gate.exe" "assets/AgentGate.exe"
+            cp README.md release-pkg/ 2>/dev/null || true
+            cp CHANGELOG.md release-pkg/ 2>/dev/null || true
+            cp LICENSE release-pkg/ 2>/dev/null || true
+
+            makensis "/DOUT_FILE=${ROOT_DIR}/release-packages/${PKG_NAME}-setup.exe" assets/installer.nsi
+
             cd release-pkg
             7z a "${ROOT_DIR}/release-packages/${PKG_NAME}.zip" *
           else
+            # Linux: 生成包含 .desktop 与系统图标的标准 .deb 安装包及便携 .tar.gz
+            DEB_ARCH="amd64"
+            if [[ "${{ matrix.target }}" == aarch64* ]]; then
+              DEB_ARCH="arm64"
+            fi
+            DEB_ROOT="${ROOT_DIR}/deb-pkg"
+            mkdir -p \
+              "${DEB_ROOT}/DEBIAN" \
+              "${DEB_ROOT}/usr/bin" \
+              "${DEB_ROOT}/usr/share/applications" \
+              "${DEB_ROOT}/usr/share/icons/hicolor/256x256/apps" \
+              "${DEB_ROOT}/usr/share/icons/hicolor/512x512/apps"
+
+            cp "target/${{ matrix.target }}/release/agent-gate" "${DEB_ROOT}/usr/bin/agent-gate"
+            chmod 0755 "${DEB_ROOT}/usr/bin/agent-gate"
+            cp "assets/agent-gate.desktop" "${DEB_ROOT}/usr/share/applications/agent-gate.desktop"
+            chmod 0644 "${DEB_ROOT}/usr/share/applications/agent-gate.desktop"
+            cp "assets/AppIcon-256.png" "${DEB_ROOT}/usr/share/icons/hicolor/256x256/apps/agent-gate.png"
+            cp "assets/AppIcon-512.png" "${DEB_ROOT}/usr/share/icons/hicolor/512x512/apps/agent-gate.png"
+
+            cat > "${DEB_ROOT}/DEBIAN/control" <<EOF
+Package: agent-gate
+Version: ${VER}
+Section: utils
+Priority: optional
+Architecture: ${DEB_ARCH}
+Maintainer: AgentGate <noreply@agentgate.io>
+Depends: libc6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6
+Description: Local SSH Isolation Relay Workbench for AI Agents
+ Menu-bar SSH isolation relay workbench built with Rust and GPUI.
+EOF
+            dpkg-deb --build --root-owner-group "${DEB_ROOT}" "${ROOT_DIR}/release-packages/${PKG_NAME}.deb"
+
+            mkdir -p release-pkg
+            cp "target/${{ matrix.target }}/release/agent-gate" "release-pkg/agent-gate"
+            cp "assets/agent-gate.desktop" "release-pkg/agent-gate.desktop"
+            cp "assets/AppIcon-256.png" "release-pkg/agent-gate.png"
+            cp README.md release-pkg/ 2>/dev/null || true
+            cp CHANGELOG.md release-pkg/ 2>/dev/null || true
+            cp LICENSE release-pkg/ 2>/dev/null || true
             cd release-pkg
             tar -czvf "${ROOT_DIR}/release-packages/${PKG_NAME}.tar.gz" *
           fi
@@ -190,6 +249,14 @@ jobs:
           mkdir -p release-assets
           cp downloaded-artifacts/* release-assets/
           cd release-assets && sha256sum * > checksums.txt
+
+      - name: Clean existing release assets on re-publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          gh release delete "$TAG" --yes 2>/dev/null || true
 
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2

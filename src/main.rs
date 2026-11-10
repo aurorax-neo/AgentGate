@@ -22,6 +22,32 @@ fn main() {
             .expect("导出菜单栏图标设计预览失败");
         return;
     }
+    if let Ok(assets_dir) = std::env::var("AGENTGATE_EXPORT_APP_ICONS_DIR")
+        && !assets_dir.trim().is_empty()
+    {
+        let base = std::path::Path::new(&assets_dir);
+        tray::export_app_icon_ico(&base.join("AppIcon.ico")).expect("导出 AppIcon.ico 失败");
+        tray::export_app_icon_png(256, &base.join("AppIcon-256.png"))
+            .expect("导出 AppIcon-256.png 失败");
+        tray::export_app_icon_png(512, &base.join("AppIcon-512.png"))
+            .expect("导出 AppIcon-512.png 失败");
+        let iconset = base.join("AppIcon.iconset");
+        for (name, sz) in [
+            ("icon_16x16.png", 16u32),
+            ("icon_16x16@2x.png", 32),
+            ("icon_32x32.png", 32),
+            ("icon_32x32@2x.png", 64),
+            ("icon_128x128.png", 128),
+            ("icon_128x128@2x.png", 256),
+            ("icon_256x256.png", 256),
+            ("icon_256x256@2x.png", 512),
+            ("icon_512x512.png", 512),
+            ("icon_512x512@2x.png", 1024),
+        ] {
+            tray::export_app_icon_png(sz, &iconset.join(name)).expect("导出 iconset 帧失败");
+        }
+        return;
+    }
 
     // 预热后台 Tokio SSH 运行时
     let _ = ssh_relay::global_tokio_runtime();
