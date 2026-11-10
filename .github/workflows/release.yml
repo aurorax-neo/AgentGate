@@ -128,8 +128,8 @@ jobs:
             if [ ! -x "$MAKENSIS" ]; then
               choco install nsis -y --no-progress
             fi
-            WIN_ROOT="$(pwd -W)"
-            "$MAKENSIS" "/DOUT_FILE=${WIN_ROOT}/release-packages/${PKG_NAME}-setup.exe" assets/installer.nsi
+            "$MAKENSIS" assets/installer.nsi
+            mv assets/AgentGate-setup.exe "${ROOT_DIR}/release-packages/${PKG_NAME}-setup.exe"
 
             cd release-pkg
             7z a "${ROOT_DIR}/release-packages/${PKG_NAME}.zip" *

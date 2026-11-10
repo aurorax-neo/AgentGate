@@ -1,7 +1,7 @@
 !include "MUI2.nsh"
 
 Name "AgentGate"
-OutFile "${OUT_FILE}"
+OutFile "AgentGate-setup.exe"
 InstallDir "$PROGRAMFILES64\AgentGate"
 RequestExecutionLevel admin
 Unicode True
