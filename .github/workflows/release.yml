@@ -149,17 +149,17 @@ jobs:
             cp "assets/AppIcon-256.png" "${DEB_ROOT}/usr/share/icons/hicolor/256x256/apps/agent-gate.png"
             cp "assets/AppIcon-512.png" "${DEB_ROOT}/usr/share/icons/hicolor/512x512/apps/agent-gate.png"
 
-            cat > "${DEB_ROOT}/DEBIAN/control" <<EOF
-Package: agent-gate
-Version: ${VER}
-Section: utils
-Priority: optional
-Architecture: ${DEB_ARCH}
-Maintainer: AgentGate <noreply@agentgate.io>
-Depends: libc6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6
-Description: Local SSH Isolation Relay Workbench for AI Agents
- Menu-bar SSH isolation relay workbench built with Rust and GPUI.
-EOF
+            {
+              echo "Package: agent-gate"
+              echo "Version: ${VER}"
+              echo "Section: utils"
+              echo "Priority: optional"
+              echo "Architecture: ${DEB_ARCH}"
+              echo "Maintainer: AgentGate <noreply@agentgate.io>"
+              echo "Depends: libc6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6"
+              echo "Description: Local SSH Isolation Relay Workbench for AI Agents"
+              echo " Menu-bar SSH isolation relay workbench built with Rust and GPUI."
+            } > "${DEB_ROOT}/DEBIAN/control"
             dpkg-deb --build --root-owner-group "${DEB_ROOT}" "${ROOT_DIR}/release-packages/${PKG_NAME}.deb"
 
             mkdir -p release-pkg
