@@ -1,0 +1,202 @@
+name: Release & Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布版本号 (例如 v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+# 开启并发控制，重推 Tag 或修复时自动取消前序挂起任务，杜绝 Actions 额度浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 阶段 1: 多架构二进制并行构建
+  build-binaries:
+    name: Build Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            use_cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 规范：剥离本地特有的国内代理配置，防止海外 Runner 访问超时
+      - name: Remove local package proxy in CI
+        shell: bash
+        run: rm -f .cargo/config.toml .cargo/config
+
+      - name: Install Linux GUI system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build target binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          TAG_NAME="${{ inputs.tag || github.ref_name }}"
+          [ "$TAG_NAME" = "" ] || [ "$TAG_NAME" = "main" ] && TAG_NAME="dev"
+          PKG_NAME="agent-gate_${TAG_NAME}_${{ matrix.target }}"
+          ROOT_DIR="$(pwd)"
+          mkdir -p "${ROOT_DIR}/release-packages" release-pkg
+
+          BIN_NAME="agent-gate"
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            EXT=".exe"
+          fi
+
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${EXT}" "release-pkg/${BIN_NAME}${EXT}"
+          cp README.md release-pkg/ 2>/dev/null || true
+          cp CHANGELOG.md release-pkg/ 2>/dev/null || true
+          cp LICENSE release-pkg/ 2>/dev/null || true
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cd release-pkg
+            7z a "${ROOT_DIR}/release-packages/${PKG_NAME}.zip" *
+          else
+            cd release-pkg
+            tar -czvf "${ROOT_DIR}/release-packages/${PKG_NAME}.tar.gz" *
+          fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: release-packages/*
+          retention-days: 1
+
+  # 阶段 2: 发布 GitHub Release 静态包与校验和（含发布日志强校验）
+  publish-release:
+    name: Publish GitHub Release Assets
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 约束 1：Tag 必须符合 SemVer ──────────────────────────
+      - name: Validate tag format (SemVer)
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' 不符合 SemVer（应为 vX.Y.Z 或 vX.Y.Z-pre）"
+            exit 1
+          fi
+
+      # ── 约束 2：源码版本号与 Tag 一致 ────────────────────────
+      - name: Verify version matches Tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"; VER="${TAG#v}"
+          SRC_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$SRC_VER" != "$VER" ]; then
+            echo "::error::Cargo.toml version=$SRC_VER 与 Tag=$VER 不一致"
+            exit 1
+          fi
+
+      # ── 约束 3：CHANGELOG 必须包含当前版本段落且非空 ─────────
+      - name: Verify CHANGELOG entry
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"; VER="${TAG#v}"
+          if ! grep -qE "^##\s*\[?${VER}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 缺少版本 $VER 的条目，请先补充后重推 Tag"
+            exit 1
+          fi
+
+      - name: Extract release body from CHANGELOG
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"; VER="${TAG#v}"
+          BODY=$(awk -v ver="$VER" '
+            $0 ~ "^## \\[?"ver"\\]?" {flag=1; next}
+            flag && /^## / {exit}
+            flag && NF {print}
+          ' CHANGELOG.md)
+          if [ -z "${BODY//[[:space:]]/}" ]; then
+            echo "::error::CHANGELOG 中版本 $VER 内容为空"
+            exit 1
+          fi
+          { echo "body<<__EOF__"; echo "$BODY"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+          pattern: package-*
+          merge-multiple: true
+
+      - name: Generate Checksums
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp downloaded-artifacts/* release-assets/
+          cd release-assets && sha256sum * > checksums.txt
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,51 @@
+name: Cross-Platform Build & Test (Linux / Windows / macOS)
+
+on:
+  push:
+    branches: ["main", "master", "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.platform_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_name: Linux (x86_64 Wayland/X11)
+          - os: windows-latest
+            platform_name: Windows (x86_64 Direct3D11/DirectWrite)
+          - os: macos-latest
+            platform_name: macOS (Apple Silicon Metal)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux GUI system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit & end-to-end SSH relay tests
+        run: cargo test --verbose
+
+      - name: Build release binary
+        run: cargo build --release --verbose
