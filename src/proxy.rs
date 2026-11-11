@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use data_encoding::BASE64;
@@ -59,10 +59,25 @@ pub async fn connect_via_proxy(
 }
 
 async fn connect_direct(target_host: &str, target_port: u16) -> Result<TcpStream> {
+    let started = Instant::now();
     timeout(CONNECT_TIMEOUT, TcpStream::connect((target_host, target_port)))
         .await
-        .map_err(|_| anyhow!("连接上游目标超时"))?
-        .map_err(|e| anyhow!("无法连接上游目标主机 ({})", e.kind()))
+        .map_err(|_| {
+            anyhow!(
+                "[阶段: TCP直连] 连接上游目标端口 :{} 超时 (耗时 {}ms，目标不可达或防火墙丢包)",
+                target_port,
+                started.elapsed().as_millis()
+            )
+        })?
+        .map_err(|e| {
+            anyhow!(
+                "[阶段: TCP直连] 无法连接上游目标端口 :{} (错误: {} / {}, 耗时 {}ms)",
+                target_port,
+                e.kind(),
+                e,
+                started.elapsed().as_millis()
+            )
+        })
 }
 
 async fn connect_socks5(

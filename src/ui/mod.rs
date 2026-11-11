@@ -102,6 +102,7 @@ pub struct AgentGateWorkbench {
     event_tx: mpsc::UnboundedSender<RelayEvent>,
 
     is_dark: bool,
+    show_local_pwd: bool,
     log_scope: LogScope,
     selected_host_id: Option<Uuid>,
     show_host_modal: bool,
@@ -200,7 +201,7 @@ impl AgentGateWorkbench {
         let form_label = cx.new(|cx| TextField::new(cx, "本机可见备注（不发给 Agent）", false));
         let form_local_host = cx.new(|cx| TextField::new(cx, "127.0.0.1", false));
         let form_local_port = cx.new(|cx| TextField::new(cx, "本机固定端口 (1~65535)", false));
-        let form_agent_password = cx.new(|cx| TextField::new(cx, "暴露给 Agent 的本地连接密码", false));
+        let form_agent_password = cx.new(|cx| TextField::new(cx, "暴露给 Agent 的本地连接密码", true));
         let form_real_host = cx.new(|cx| TextField::new(cx, "真实远端 IP 或域名（仅存本机）", false));
         let form_real_port = cx.new(|cx| TextField::new(cx, "22", false));
         let form_real_user = cx.new(|cx| TextField::new(cx, "root / ubuntu", false));
@@ -219,6 +220,7 @@ impl AgentGateWorkbench {
             controls: HashMap::new(),
             event_tx,
             is_dark: prefs.is_dark,
+            show_local_pwd: false,
             log_scope: prefs.log_scope,
             selected_host_id,
             show_host_modal: false,
@@ -1389,7 +1391,7 @@ impl AgentGateWorkbench {
                     .child(
                         action_button(
                             "btn-new-host",
-                            "+ 新建主机",
+                            "+ 新建",
                             theme,
                             true,
                             false,
@@ -1405,7 +1407,7 @@ impl AgentGateWorkbench {
                     .child(
                         action_button(
                             "btn-stop-all",
-                            "全部停止",
+                            "全停",
                             theme,
                             running_count > 0,
                             true,
@@ -1427,7 +1429,38 @@ impl AgentGateWorkbench {
                             this.save_ui_prefs();
                             cx.notify();
                         })),
-                    ),
+                    )
+                    .when(cfg!(not(target_os = "macos")), |bar| {
+                        bar.child(
+                            div()
+                                .pl_1()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    window_ctrl_button("win-btn-min", "—", theme, false)
+                                        .on_click(cx.listener(|_, _, window, _| {
+                                            window.minimize_window();
+                                        })),
+                                )
+                                .child(
+                                    window_ctrl_button("win-btn-max", "□", theme, false)
+                                        .on_click(cx.listener(|_, _, window, _| {
+                                            window.zoom_window();
+                                        })),
+                                )
+                                .child(
+                                    window_ctrl_button("win-btn-close", "×", theme, true)
+                                        .on_click(cx.listener(|_, _, window, _| {
+                                            platform_set_window_visible(false);
+                                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                            window.minimize_window();
+                                            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                                            let _ = window;
+                                        })),
+                                ),
+                        )
+                    }),
             )
     }
 
@@ -1771,9 +1804,9 @@ impl AgentGateWorkbench {
                                         action_button(
                                             "detail-toggle-relay",
                                             if is_running {
-                                                "停止中转"
+                                                "停止"
                                             } else {
-                                                "启动中转"
+                                                "启动"
                                             },
                                             theme,
                                             true,
@@ -1807,7 +1840,7 @@ impl AgentGateWorkbench {
                                         let host_edit = host.clone();
                                         action_button(
                                             "detail-edit-host",
-                                            "编辑主机",
+                                            "编辑",
                                             theme,
                                             true,
                                             false,
@@ -1905,7 +1938,7 @@ impl AgentGateWorkbench {
                                                     == AgentAuthMode::EphemeralPassword;
                                                 action_button(
                                                     "switch-mode-pwd",
-                                                    "固定密码",
+                                                    "密码",
                                                     theme,
                                                     !is_pwd,
                                                     false,
@@ -1937,7 +1970,7 @@ impl AgentGateWorkbench {
                                                     == AgentAuthMode::DedicatedKey;
                                                 action_button(
                                                     "switch-mode-key",
-                                                    "专用密钥 (Ed25519)",
+                                                    "密钥",
                                                     theme,
                                                     !is_key,
                                                     false,
@@ -2005,7 +2038,11 @@ impl AgentGateWorkbench {
                                                     .text_color(theme.text_primary)
                                                     .child(match host.agent_auth_mode {
                                                         AgentAuthMode::EphemeralPassword => {
-                                                            host.agent_password.clone()
+                                                            if self.show_local_pwd {
+                                                                host.agent_password.clone()
+                                                            } else {
+                                                                "•".repeat(host.agent_password.len().min(27))
+                                                            }
                                                         }
                                                         AgentAuthMode::DedicatedKey => rt
                                                             .dedicated_key_path
@@ -2014,31 +2051,94 @@ impl AgentGateWorkbench {
                                                     }),
                                             ),
                                     )
-                                    .child({
-                                        let c_rot = codename.clone();
-                                        let mode = host.agent_auth_mode;
-                                        action_button(
-                                            "btn-rotate-cred",
-                                            match mode {
-                                                AgentAuthMode::EphemeralPassword => "轮换密码",
-                                                AgentAuthMode::DedicatedKey => "重置密钥",
-                                            },
-                                            theme,
-                                            true,
-                                            false,
-                                        )
-                                        .h(px(28.))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.request_confirmation(
-                                                PendingAction::RotateCredentials {
-                                                    id: selected_id,
-                                                    codename: c_rot.clone(),
-                                                    mode,
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .when(
+                                                host.agent_auth_mode
+                                                    == AgentAuthMode::EphemeralPassword,
+                                                |row| {
+                                                    row.child(
+                                                        eye_icon_button(
+                                                            "btn-eye-local-pwd",
+                                                            self.show_local_pwd,
+                                                            theme,
+                                                        )
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.show_local_pwd =
+                                                                !this.show_local_pwd;
+                                                            cx.notify();
+                                                        })),
+                                                    )
                                                 },
-                                                cx,
-                                            );
-                                        }))
-                                    }),
+                                            )
+                                            .child({
+                                                let val_to_copy = match host.agent_auth_mode {
+                                                    AgentAuthMode::EphemeralPassword => {
+                                                        host.agent_password.clone()
+                                                    }
+                                                    AgentAuthMode::DedicatedKey => rt
+                                                        .dedicated_key_path
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                };
+                                                let c_copy = codename.clone();
+                                                action_button(
+                                                    "btn-copy-local-cred",
+                                                    "复制",
+                                                    theme,
+                                                    !val_to_copy.is_empty(),
+                                                    false,
+                                                )
+                                                .h(px(26.))
+                                                .px_2p5()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if !val_to_copy.is_empty() {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                val_to_copy.clone(),
+                                                            ),
+                                                        );
+                                                        this.status_banner = Some((
+                                                            format!(
+                                                                "已复制代号 [{}] 的本地凭证到剪贴板",
+                                                                c_copy
+                                                            ),
+                                                            false,
+                                                        ));
+                                                        cx.notify();
+                                                    }
+                                                }))
+                                            })
+                                            .child({
+                                                let c_rot = codename.clone();
+                                                let mode = host.agent_auth_mode;
+                                                action_button(
+                                                    "btn-rotate-cred",
+                                                    match mode {
+                                                        AgentAuthMode::EphemeralPassword => "轮换",
+                                                        AgentAuthMode::DedicatedKey => "重置",
+                                                    },
+                                                    theme,
+                                                    true,
+                                                    false,
+                                                )
+                                                .h(px(26.))
+                                                .px_2p5()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.request_confirmation(
+                                                        PendingAction::RotateCredentials {
+                                                            id: selected_id,
+                                                            codename: c_rot.clone(),
+                                                            mode,
+                                                        },
+                                                        cx,
+                                                    );
+                                                }))
+                                            }),
+                                    ),
                             )
                             .child(
                                 div()
@@ -2123,7 +2223,7 @@ impl AgentGateWorkbench {
                                                 let c_card = codename.clone();
                                                 action_button(
                                                     "btn-copy-agent-card",
-                                                    "复制提示词卡片",
+                                                    "复制卡片",
                                                     theme,
                                                     is_running,
                                                     false,
@@ -2159,7 +2259,7 @@ impl AgentGateWorkbench {
                                                 let c_cmd = codename.clone();
                                                 action_button(
                                                     "btn-copy-ssh-cmd",
-                                                    "复制 SSH 命令",
+                                                    "复制命令",
                                                     theme,
                                                     is_running,
                                                     false,
@@ -2216,6 +2316,8 @@ impl AgentGateWorkbench {
     ) -> impl IntoElement {
         let is_editing = self.editing_host_id.is_some();
         let secret_masked = self.form_real_secret.read(cx).is_masked();
+        let agent_pwd_masked = self.form_agent_password.read(cx).is_masked();
+        let proxy_pwd_masked = self.form_proxy_pass.read(cx).is_masked();
 
         div()
             .id("host-editor-modal-backdrop")
@@ -2261,7 +2363,7 @@ impl AgentGateWorkbench {
                                     }),
                             )
                             .child(
-                                action_button("form-modal-close", "关闭 (Esc)", theme, true, false)
+                                action_button("form-modal-close", "关闭", theme, true, false)
                                     .h(px(26.))
                                     .px_2p5()
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2297,7 +2399,7 @@ impl AgentGateWorkbench {
                                                     .text_size(px(11.))
                                                     .text_color(theme.accent_hover)
                                                     .cursor_pointer()
-                                                    .child("随机代号")
+                                                    .child("随机")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         let generated =
                                                             RelayHost::generate_codename(
@@ -2389,21 +2491,78 @@ impl AgentGateWorkbench {
                                             .child(field_label("Agent 本地连接密码", theme))
                                             .child(
                                                 div()
-                                                    .id("btn-random-agent-pwd")
-                                                    .text_size(px(11.))
-                                                    .text_color(theme.accent_hover)
-                                                    .cursor_pointer()
-                                                    .child("随机生成")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        let pwd =
-                                                            RelayHost::generate_ephemeral_password(
-                                                            );
-                                                        this.form_agent_password.update(
-                                                            cx,
-                                                            |f, cx| f.set_text(pwd, cx),
-                                                        );
-                                                        cx.notify();
-                                                    })),
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        eye_icon_button(
+                                                            "btn-eye-form-agent-pwd",
+                                                            !agent_pwd_masked,
+                                                            theme,
+                                                        )
+                                                        .size(px(22.))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.form_agent_password.update(
+                                                                    cx,
+                                                                    |f, cx| {
+                                                                        f.set_masked(
+                                                                            !agent_pwd_masked,
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("btn-copy-form-agent-pwd")
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.accent_hover)
+                                                            .cursor_pointer()
+                                                            .child("复制")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    let val = this
+                                                                        .form_agent_password
+                                                                        .read(cx)
+                                                                        .text();
+                                                                    if !val.is_empty() {
+                                                                        cx.write_to_clipboard(
+                                                                            ClipboardItem::new_string(
+                                                                                val,
+                                                                            ),
+                                                                        );
+                                                                        this.status_banner = Some((
+                                                                            "已复制本地连接密码到剪贴板"
+                                                                                .to_string(),
+                                                                            false,
+                                                                        ));
+                                                                        cx.notify();
+                                                                    }
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("btn-random-agent-pwd")
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.accent_hover)
+                                                            .cursor_pointer()
+                                                            .child("随机")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    let pwd = RelayHost::generate_ephemeral_password();
+                                                                    this.form_agent_password
+                                                                        .update(cx, |f, cx| {
+                                                                            f.set_text(pwd, cx)
+                                                                        });
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    ),
                                             ),
                                     )
                                     .child(self.form_agent_password.clone()),
@@ -2462,7 +2621,7 @@ impl AgentGateWorkbench {
                                             .child(
                                                 action_button(
                                                     "auth-kind-pwd",
-                                                    "密码认证",
+                                                    "密码",
                                                     theme,
                                                     true,
                                                     false,
@@ -2486,7 +2645,7 @@ impl AgentGateWorkbench {
                                             .child(
                                                 action_button(
                                                     "auth-kind-key",
-                                                    "私钥 PEM",
+                                                    "私钥",
                                                     theme,
                                                     true,
                                                     false,
@@ -2505,24 +2664,42 @@ impl AgentGateWorkbench {
                                                 })),
                                             )
                                             .child(
-                                                action_button(
+                                                eye_icon_button(
                                                     "toggle-secret-mask",
-                                                    if secret_masked {
-                                                        "显示明文"
-                                                    } else {
-                                                        "隐藏明文"
-                                                    },
+                                                    !secret_masked,
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.form_real_secret.update(cx, |f, cx| {
+                                                        f.set_masked(!secret_masked, cx);
+                                                    });
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                action_button(
+                                                    "btn-copy-real-secret",
+                                                    "复制",
                                                     theme,
                                                     true,
                                                     false,
                                                 )
                                                 .h(px(25.))
                                                 .px_2p5()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.form_real_secret.update(cx, |f, cx| {
-                                                        f.set_masked(!secret_masked, cx);
-                                                    });
-                                                    cx.notify();
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let val =
+                                                        this.form_real_secret.read(cx).text();
+                                                    if !val.is_empty() {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(val),
+                                                        );
+                                                        this.status_banner = Some((
+                                                            "已复制远端认证凭据到剪贴板"
+                                                                .to_string(),
+                                                            false,
+                                                        ));
+                                                        cx.notify();
+                                                    }
                                                 })),
                                             ),
                                     ),
@@ -2603,7 +2780,7 @@ impl AgentGateWorkbench {
                                             .child(
                                                 action_button(
                                                     "proxy-http",
-                                                    "HTTP CONNECT",
+                                                    "HTTP",
                                                     theme,
                                                     true,
                                                     false,
@@ -2661,7 +2838,35 @@ impl AgentGateWorkbench {
                                                 .flex()
                                                 .flex_col()
                                                 .gap_1()
-                                                .child(field_label("代理密码", theme))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .child(field_label("代理密码", theme))
+                                                        .child(
+                                                            eye_icon_button(
+                                                                "btn-eye-proxy-pwd",
+                                                                !proxy_pwd_masked,
+                                                                theme,
+                                                            )
+                                                            .size(px(20.))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.form_proxy_pass.update(
+                                                                        cx,
+                                                                        |f, cx| {
+                                                                            f.set_masked(
+                                                                                !proxy_pwd_masked,
+                                                                                cx,
+                                                                            )
+                                                                        },
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                        ),
+                                                )
                                                 .child(self.form_proxy_pass.clone()),
                                         ),
                                 )
@@ -2682,7 +2887,7 @@ impl AgentGateWorkbench {
                                     .child(
                                         action_button(
                                             "form-agent-mode-pwd",
-                                            "固定密码",
+                                            "密码",
                                             theme,
                                             true,
                                             false,
@@ -2703,7 +2908,7 @@ impl AgentGateWorkbench {
                                     .child(
                                         action_button(
                                             "form-agent-mode-key",
-                                            "专用本地密钥 (Ed25519)",
+                                            "密钥",
                                             theme,
                                             true,
                                             false,
@@ -2762,9 +2967,9 @@ impl AgentGateWorkbench {
                                         action_button(
                                             "form-save-submit",
                                             if is_editing {
-                                                "保存配置修改"
+                                                "保存"
                                             } else {
-                                                "创建中转主机"
+                                                "创建"
                                             },
                                             theme,
                                             true,
@@ -2817,6 +3022,7 @@ impl AgentGateWorkbench {
         }
         all_logs.sort_by(|a, b| b.seq.cmp(&a.seq));
         let is_cur_scope = self.log_scope == LogScope::SelectedHost;
+        let all_logs_for_copy = all_logs.clone();
 
         div()
             .flex_1()
@@ -2837,7 +3043,7 @@ impl AgentGateWorkbench {
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(theme.text_primary)
-                            .child(format!("实时转发脱敏审计流 ({})", all_logs.len())),
+                            .child(format!("日志 ({})", all_logs.len())),
                     )
                     .child(
                         div()
@@ -2846,8 +3052,42 @@ impl AgentGateWorkbench {
                             .gap_1p5()
                             .child(
                                 action_button(
+                                    "log-copy-all",
+                                    "复制全部",
+                                    theme,
+                                    !all_logs_for_copy.is_empty(),
+                                    false,
+                                )
+                                .h(px(24.))
+                                .px_2p5()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !all_logs_for_copy.is_empty() {
+                                        let text = all_logs_for_copy
+                                            .iter()
+                                            .map(|l| {
+                                                format!(
+                                                    "[{}] [{}] {} — {}",
+                                                    l.timestamp, l.codename, l.event, l.detail
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                        this.status_banner = Some((
+                                            format!(
+                                                "已复制全部 {} 条日志到剪贴板",
+                                                all_logs_for_copy.len()
+                                            ),
+                                            false,
+                                        ));
+                                        cx.notify();
+                                    }
+                                })),
+                            )
+                            .child(
+                                action_button(
                                     "log-scope-selected",
-                                    "当前主机",
+                                    "当前",
                                     theme,
                                     !is_cur_scope,
                                     false,
@@ -2866,7 +3106,7 @@ impl AgentGateWorkbench {
                             .child(
                                 action_button(
                                     "log-scope-all",
-                                    "全部主机",
+                                    "全部",
                                     theme,
                                     is_cur_scope,
                                     false,
@@ -2904,10 +3144,14 @@ impl AgentGateWorkbench {
                                 .p_4()
                                 .text_size(px(12.))
                                 .text_color(theme.text_muted)
-                                .child("暂无转发审计记录。启动中转或由 Agent 发起连接后将实时记录。"),
+                                .child("暂无日志记录。启动中转或由 Agent 发起连接后将实时记录详细诊断信息。"),
                         )
                     })
-                    .children(all_logs.into_iter().take(60).map(|entry| {
+                    .children(all_logs.into_iter().take(80).enumerate().map(|(idx, entry)| {
+                        let copy_line = format!(
+                            "[{}] [{}] {} — {}",
+                            entry.timestamp, entry.codename, entry.event, entry.detail
+                        );
                         div()
                             .px_2p5()
                             .py_1p5()
@@ -2918,9 +3162,12 @@ impl AgentGateWorkbench {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .text_size(px(11.5))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
                                     .gap_2()
@@ -2947,12 +3194,32 @@ impl AgentGateWorkbench {
                                                 theme.text_primary
                                             })
                                             .child(entry.event),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_color(if entry.is_error {
+                                                theme.danger_hover
+                                            } else {
+                                                theme.text_secondary
+                                            })
+                                            .child(entry.detail),
                                     ),
                             )
                             .child(
-                                div()
-                                    .text_color(theme.text_secondary)
-                                    .child(entry.detail),
+                                action_button(("copy-log-row", idx), "复制", theme, true, false)
+                                    .h(px(22.))
+                                    .px_2()
+                                    .text_size(px(11.))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_line.clone(),
+                                        ));
+                                        this.status_banner =
+                                            Some(("已复制该条日志详情到剪贴板".to_string(), false));
+                                        cx.notify();
+                                    })),
                             )
                     })),
             )
@@ -3044,7 +3311,7 @@ impl AgentGateWorkbench {
                             .justify_end()
                             .gap_2p5()
                             .child(
-                                action_button("modal-cancel-btn", "取消 (Esc)", theme, true, false)
+                                action_button("modal-cancel-btn", "取消", theme, true, false)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pending_confirm = None;
                                         this.status_banner =
@@ -3183,6 +3450,92 @@ fn theme_icon_button(
                 )
                 .into_any_element()
         })
+}
+
+/// 渲染纯几何小眼睛显隐控制图标按钮（is_visible=true 显示睁眼图标，false 显示带斜杠闭眼图标）
+fn eye_icon_button(
+    id: impl Into<ElementId>,
+    is_visible: bool,
+    theme: WorkbenchTheme,
+) -> Stateful<gpui::Div> {
+    let stroke = if is_visible {
+        theme.accent_hover
+    } else {
+        theme.text_secondary
+    };
+    div()
+        .id(id)
+        .size(px(26.))
+        .rounded(px(5.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_elevated)
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.bg_subtle))
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(9.))
+                .rounded(px(5.))
+                .border_1()
+                .border_color(stroke)
+                .flex()
+                .items_center()
+                .justify_center()
+                .relative()
+                .child(
+                    div()
+                        .size(px(4.5))
+                        .rounded(px(2.5))
+                        .bg(if is_visible {
+                            stroke
+                        } else {
+                            theme.text_muted
+                        }),
+                )
+                .when(!is_visible, |eye| {
+                    eye.child(
+                        div()
+                            .absolute()
+                            .w(px(14.))
+                            .h(px(1.5))
+                            .bg(theme.danger),
+                    )
+                }),
+        )
+}
+
+/// 渲染非 macOS 平台的最小化 / 最大化 / 关闭窗口图标按钮
+fn window_ctrl_button(
+    id: impl Into<ElementId>,
+    symbol: &'static str,
+    theme: WorkbenchTheme,
+    is_close: bool,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_elevated)
+        .text_color(theme.text_secondary)
+        .text_size(px(12.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(move |s| {
+            if is_close {
+                s.bg(theme.danger).text_color(rgb(0xffffff))
+            } else {
+                s.bg(theme.bg_subtle).text_color(theme.text_primary)
+            }
+        })
+        .child(symbol)
 }
 
 fn field_label(text: &'static str, theme: WorkbenchTheme) -> impl IntoElement {

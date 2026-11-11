@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use russh::keys::ssh_key::{Algorithm, PrivateKey, PublicKey};
+use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key};
 use russh::server::{
     Auth, Msg as ServerMsg, PublicKeyOffer, Session as ServerSession, VerifiedPublicKey,
@@ -435,16 +435,62 @@ impl LocalSshHandler {
         let host = self.current_host();
         let live_host_ref = self.live_host.clone();
         let event_tx = self.event_tx.clone();
+        let started = Instant::now();
 
         let connect_fut = async {
             let tcp_stream =
                 connect_via_proxy(&host.proxy, &host.real_host, host.real_port).await?;
+
+            let preferred = Preferred {
+                kex: Cow::Owned(
+                    russh::kex::ALL_KEX_ALGORITHMS
+                        .iter()
+                        .filter(|n| ***n != russh::kex::NONE)
+                        .map(|n| **n)
+                        .collect(),
+                ),
+                key: Cow::Borrowed(&[
+                    Algorithm::Ed25519,
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP256,
+                    },
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP384,
+                    },
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP521,
+                    },
+                    Algorithm::Rsa {
+                        hash: Some(HashAlg::Sha512),
+                    },
+                    Algorithm::Rsa {
+                        hash: Some(HashAlg::Sha256),
+                    },
+                    Algorithm::Rsa { hash: None },
+                ]),
+                cipher: Cow::Owned(
+                    russh::cipher::ALL_CIPHERS
+                        .iter()
+                        .filter(|n| ***n != russh::cipher::CLEAR)
+                        .map(|n| **n)
+                        .collect(),
+                ),
+                mac: Cow::Owned(
+                    russh::mac::ALL_MAC_ALGORITHMS
+                        .iter()
+                        .filter(|n| ***n != russh::mac::NONE)
+                        .map(|n| **n)
+                        .collect(),
+                ),
+                ..Preferred::DEFAULT
+            };
 
             let client_cfg = Arc::new(client::Config {
                 inactivity_timeout: Some(Duration::from_secs(1800)),
                 keepalive_interval: Some(Duration::from_secs(30)),
                 keepalive_max: 6,
                 nodelay: true,
+                preferred,
                 ..Default::default()
             });
 
@@ -456,22 +502,76 @@ impl LocalSshHandler {
             .await
             .map_err(|e| {
                 anyhow!(
-                    "上游 SSH 协议握手失败: {}",
+                    "[阶段: SSH协议握手] 协商失败 (代理: {}, 端口: :{}, 耗时: {}ms, 原因: {})",
+                    host.proxy.badge_text(),
+                    host.real_port,
+                    started.elapsed().as_millis(),
                     sanitize_error(&e.to_string(), &host)
                 )
             })?;
 
-            let auth_ok = match &host.real_auth {
-                RealAuthConfig::Password { password } => handle
-                    .authenticate_password(&host.real_user, password.clone())
-                    .await
-                    .map_err(|e| {
-                        anyhow!(
-                            "上游密码认证请求失败: {}",
-                            sanitize_error(&e.to_string(), &host)
+            let (auth_ok, auth_diag) = match &host.real_auth {
+                RealAuthConfig::Password { password } => {
+                    let pwd_clean = password.trim_matches(['\r', '\n']);
+                    let pwd_res = handle
+                        .authenticate_password(&host.real_user, pwd_clean.to_string())
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "[阶段: SSH密码认证] 请求异常 (耗时: {}ms, 原因: {})",
+                                started.elapsed().as_millis(),
+                                sanitize_error(&e.to_string(), &host)
+                            )
+                        })?;
+                    if pwd_res.success() {
+                        (true, String::new())
+                    } else {
+                        let remaining_str = format!("{:?}", pwd_res);
+                        // 自动回退尝试 PAM keyboard-interactive 认证
+                        let mut kbd_ok = false;
+                        if let Ok(mut resp) = handle
+                            .authenticate_keyboard_interactive_start(&host.real_user, None)
+                            .await
+                        {
+                            for _ in 0..4 {
+                                match resp {
+                                    client::KeyboardInteractiveAuthResponse::Success => {
+                                        kbd_ok = true;
+                                        break;
+                                    }
+                                    client::KeyboardInteractiveAuthResponse::Failure { .. } => {
+                                        break;
+                                    }
+                                    client::KeyboardInteractiveAuthResponse::InfoRequest {
+                                        prompts,
+                                        ..
+                                    } => {
+                                        let answers = if prompts.is_empty() {
+                                            Vec::new()
+                                        } else {
+                                            vec![pwd_clean.to_string(); prompts.len()]
+                                        };
+                                        match handle
+                                            .authenticate_keyboard_interactive_respond(answers)
+                                            .await
+                                        {
+                                            Ok(next) => resp = next,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (
+                            kbd_ok,
+                            format!(
+                                "password 与 keyboard-interactive 均被拒绝 (密码长度: {} 字符, 服务端返回: {})",
+                                pwd_clean.chars().count(),
+                                sanitize_error(&remaining_str, &host)
+                            ),
                         )
-                    })?
-                    .success(),
+                    }
+                }
                 RealAuthConfig::PrivateKey {
                     private_key_pem,
                     passphrase,
@@ -480,7 +580,12 @@ impl LocalSshHandler {
                         private_key_pem,
                         passphrase.as_deref().filter(|p| !p.is_empty()),
                     )
-                    .map_err(|_| anyhow!("解析真实远端私钥失败，请检查私钥格式或口令"))?;
+                    .map_err(|e| {
+                        anyhow!(
+                            "[阶段: 本地私钥解析] 解析真实远端私钥失败 ({})",
+                            sanitize_error(&e.to_string(), &host)
+                        )
+                    })?;
                     let rsa_hash = if decoded_key.algorithm().is_rsa() {
                         handle
                             .best_supported_rsa_hash()
@@ -491,7 +596,7 @@ impl LocalSshHandler {
                     } else {
                         None
                     };
-                    handle
+                    let key_res = handle
                         .authenticate_publickey(
                             &host.real_user,
                             PrivateKeyWithHashAlg::new(Arc::new(decoded_key), rsa_hash),
@@ -499,16 +604,23 @@ impl LocalSshHandler {
                         .await
                         .map_err(|e| {
                             anyhow!(
-                                "上游私钥认证请求失败: {}",
+                                "[阶段: SSH公钥认证] 请求异常 (耗时: {}ms, 原因: {})",
+                                started.elapsed().as_millis(),
                                 sanitize_error(&e.to_string(), &host)
                             )
-                        })?
-                        .success()
+                        })?;
+                    let ok = key_res.success();
+                    (ok, format!("服务端返回: {:?}", key_res))
                 }
             };
 
             if !auth_ok {
-                return Err(anyhow!("真实远端服务器拒绝了已保存的认证凭据"));
+                return Err(anyhow!(
+                    "[阶段: SSH身份认证] 真实远端服务器拒绝了凭据 (端口: :{}, 耗时: {}ms, 详情: {})",
+                    host.real_port,
+                    started.elapsed().as_millis(),
+                    auth_diag
+                ));
             }
 
             Ok(Arc::new(handle))
@@ -525,7 +637,12 @@ impl LocalSshHandler {
             }
             Err(_) => {
                 self.upstream_failed = true;
-                Err(anyhow!("建立上游 SSH 隧道整体握手超时"))
+                Err(anyhow!(
+                    "[阶段: 上游总超时] 建立上游 SSH 隧道超过 {}s 限制 (代理: {}, 目标端口: :{})",
+                    UPSTREAM_HANDSHAKE_TIMEOUT.as_secs(),
+                    host.proxy.badge_text(),
+                    host.real_port
+                ))
             }
         }
     }

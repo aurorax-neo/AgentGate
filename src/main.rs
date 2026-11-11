@@ -60,13 +60,6 @@ fn main() {
         cx.on_action(|_: &QuitApp, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
-        let window_kind = if cfg!(target_os = "macos") {
-            // macOS 下已通过 NSApplicationActivationPolicyAccessory 隐藏 Dock 图标
-            WindowKind::Normal
-        } else {
-            // Windows / Linux 下使用 PopUp (WS_EX_TOOLWINDOW / Notification) 隐藏任务栏图标
-            WindowKind::PopUp
-        };
 
         cx.open_window(
             WindowOptions {
@@ -78,7 +71,10 @@ fn main() {
                 }),
                 focus: true,
                 show: true,
-                kind: window_kind,
+                kind: WindowKind::Normal,
+                is_movable: true,
+                is_resizable: true,
+                is_minimizable: true,
                 ..Default::default()
             },
             |window, cx| {

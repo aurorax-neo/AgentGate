@@ -203,7 +203,7 @@ impl TextField {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let cleaned = text.replace('\r', "");
+            let cleaned = text.replace(['\r', '\n'], "");
             self.replace_text_in_range(None, &cleaned, window, cx);
         }
     }

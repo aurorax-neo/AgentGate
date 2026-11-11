@@ -475,12 +475,11 @@ impl PendingAction {
 
     pub fn confirm_button_label(&self) -> &'static str {
         match self {
-            Self::DeleteHost { .. } | Self::StopRelay { .. } | Self::StopAllRelays { .. } => {
-                "确认停止/删除"
-            }
-            Self::StartRelay { .. } => "确认启动中转",
-            Self::CopyAgentConfig { .. } => "确认写入剪贴板",
-            _ => "确认执行",
+            Self::DeleteHost { .. } => "删除",
+            Self::StopRelay { .. } | Self::StopAllRelays { .. } => "停止",
+            Self::StartRelay { .. } => "启动",
+            Self::CopyAgentConfig { .. } => "复制",
+            _ => "确认",
         }
     }
 
