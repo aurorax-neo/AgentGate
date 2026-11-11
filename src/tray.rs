@@ -43,6 +43,15 @@ pub fn poll_tray_command() -> Option<TrayCommand> {
 }
 
 pub fn is_window_visible() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_tray::is_window_actually_front_and_visible();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_tray::is_window_actually_front_and_visible();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     WINDOW_VISIBLE.load(Ordering::SeqCst)
 }
 
@@ -388,7 +397,7 @@ mod macos_tray {
     use std::sync::Once;
 
     use cocoa::appkit::{
-        NSApplication, NSApplicationActivationPolicyAccessory,
+        NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem,
     };
     use cocoa::base::{BOOL, NO, YES, id, nil};
     use cocoa::foundation::{NSData, NSSize, NSString};
@@ -399,11 +408,227 @@ mod macos_tray {
     use super::{TrayCommand, generate_template_icon_png, send_tray_command};
 
     static REGISTER_TARGET: Once = Once::new();
+    static STATUS_ITEM_PTR: AtomicUsize = AtomicUsize::new(0);
     static STATUS_BUTTON_PTR: AtomicUsize = AtomicUsize::new(0);
+    static STATUS_MENU_PTR: AtomicUsize = AtomicUsize::new(0);
     static LOGGED_FRAME: AtomicBool = AtomicBool::new(false);
 
+    // NSEventMaskLeftMouseDown (1 << 1) | NSEventMaskRightMouseDown (1 << 3)
+    const LEFT_AND_RIGHT_MOUSE_DOWN_MASK: u64 = (1 << 1) | (1 << 3);
+    // NSEventTypeRightMouseDown = 3, NSEventTypeRightMouseUp = 4
+    const EVENT_TYPE_RIGHT_MOUSE_DOWN: u64 = 3;
+    const EVENT_TYPE_RIGHT_MOUSE_UP: u64 = 4;
+    const EVENT_TYPE_OTHER_MOUSE_DOWN: u64 = 25;
+    // NSEventModifierFlagControl = 1 << 18
+    const MODIFIER_FLAG_CONTROL: u64 = 1 << 18;
+    // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1
+    const WINDOW_COLLECTION_MOVE_TO_ACTIVE_SPACE: u64 = 1 << 1;
+    // NSApplicationActivateAllWindows (1 << 0) | NSApplicationActivateIgnoringOtherApps (1 << 1)
+    const NS_APP_ACTIVATE_ALL_AND_IGNORE_OTHER: u64 = (1 << 0) | (1 << 1);
+    // kCGWindowListOptionOnScreenOnly (1 << 0) | kCGWindowListExcludeDesktopElements (1 << 4)
+    const CG_WINDOW_LIST_ON_SCREEN_EXCLUDE_DESKTOP: u32 = (1 << 0) | (1 << 4);
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> id;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// 检查 macOS WindowServer 当前屏幕上最顶层（Z 序 #0）的普通窗口（layer == 0）是否属于本进程
+    unsafe fn is_frontmost_layer0_window_ours() -> bool {
+        let info_list = unsafe { CGWindowListCopyWindowInfo(CG_WINDOW_LIST_ON_SCREEN_EXCLUDE_DESKTOP, 0) };
+        if info_list == nil {
+            return false;
+        }
+        let key_layer = unsafe { NSString::alloc(nil).init_str("kCGWindowLayer") };
+        let key_pid = unsafe { NSString::alloc(nil).init_str("kCGWindowOwnerPID") };
+        let count: usize = unsafe { msg_send![info_list, count] };
+        let my_pid = std::process::id() as i64;
+        let mut result = false;
+
+        for i in 0..count {
+            let dict: id = unsafe { msg_send![info_list, objectAtIndex: i] };
+            if dict == nil {
+                continue;
+            }
+            let layer_obj: id = unsafe { msg_send![dict, objectForKey: key_layer] };
+            if layer_obj == nil {
+                continue;
+            }
+            let layer: i64 = unsafe { msg_send![layer_obj, integerValue] };
+            if layer != 0 {
+                continue;
+            }
+            let pid_obj: id = unsafe { msg_send![dict, objectForKey: key_pid] };
+            if pid_obj != nil {
+                let owner_pid: i64 = unsafe { msg_send![pid_obj, integerValue] };
+                result = owner_pid == my_pid;
+            }
+            break;
+        }
+
+        let _: () = unsafe { msg_send![key_layer, release] };
+        let _: () = unsafe { msg_send![key_pid, release] };
+        unsafe { CFRelease(info_list as *const c_void) };
+        result
+    }
+
+    unsafe fn is_gpui_main_window(win: id) -> bool {
+        if win == nil {
+            return false;
+        }
+        let title: id = unsafe { msg_send![win, title] };
+        if title == nil {
+            return false;
+        }
+        let c_str: *const i8 = unsafe { msg_send![title, UTF8String] };
+        if c_str.is_null() {
+            return false;
+        }
+        let title_str = unsafe { std::ffi::CStr::from_ptr(c_str) }.to_string_lossy();
+        title_str == "AgentGate"
+    }
+
+    /// 获取当前点击的状态栏按钮所在的 NSScreen（若无法获取则返回 nil）
+    unsafe fn status_button_screen() -> id {
+        // 优先根据鼠标当前全局坐标匹配所在的 NSScreen（支持多显示器各自菜单栏点击）
+        let mouse_loc: cocoa::foundation::NSPoint =
+            unsafe { msg_send![class!(NSEvent), mouseLocation] };
+        let screens: id = unsafe { msg_send![class!(NSScreen), screens] };
+        if screens != nil {
+            let count: usize = unsafe { msg_send![screens, count] };
+            for i in 0..count {
+                let scr: id = unsafe { msg_send![screens, objectAtIndex: i] };
+                let frame: cocoa::foundation::NSRect = unsafe { msg_send![scr, frame] };
+                if mouse_loc.x >= frame.origin.x
+                    && mouse_loc.x <= frame.origin.x + frame.size.width
+                    && mouse_loc.y >= frame.origin.y
+                    && mouse_loc.y <= frame.origin.y + frame.size.height
+                {
+                    return scr;
+                }
+            }
+        }
+        let ptr = STATUS_BUTTON_PTR.load(Ordering::SeqCst);
+        if ptr == 0 {
+            return nil;
+        }
+        let button = ptr as id;
+        let btn_win: id = unsafe { msg_send![button, window] };
+        if btn_win == nil {
+            return nil;
+        }
+        unsafe { msg_send![btn_win, screen] }
+    }
+
+    /// 将主窗口移动到目标显示器中央（当用户在另一块显示器点击菜单栏图标时触发）
+    unsafe fn move_window_to_screen_if_needed(win: id, target_screen: id) {
+        if win == nil || target_screen == nil {
+            return;
+        }
+        let win_screen: id = unsafe { msg_send![win, screen] };
+        if win_screen == target_screen {
+            return;
+        }
+        let vis_frame: cocoa::foundation::NSRect = unsafe { msg_send![target_screen, visibleFrame] };
+        let win_frame: cocoa::foundation::NSRect = unsafe { msg_send![win, frame] };
+        let new_x = vis_frame.origin.x + (vis_frame.size.width - win_frame.size.width) * 0.5;
+        let new_y = vis_frame.origin.y + (vis_frame.size.height - win_frame.size.height) * 0.5;
+        let new_origin = cocoa::foundation::NSPoint::new(new_x, new_y);
+        let _: () = unsafe { msg_send![win, setFrameOrigin: new_origin] };
+    }
+
+    /// 实时检测 GPUI 主窗口当前是否真正可见、位于当前点击显示器且处于前台激活状态
+    pub fn is_window_actually_front_and_visible() -> bool {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, windows];
+            let count: usize = msg_send![windows, count];
+            let clicked_screen = status_button_screen();
+            for i in 0..count {
+                let win: id = msg_send![windows, objectAtIndex: i];
+                if !is_gpui_main_window(win) {
+                    continue;
+                }
+                let is_vis: BOOL = msg_send![win, isVisible];
+                let is_mini: BOOL = msg_send![win, isMiniaturized];
+                if is_vis == NO || is_mini == YES {
+                    return false;
+                }
+                // 如果用户在另一台显示器上点击菜单栏图标，视为需要拉起到当前显示器而非隐藏
+                if clicked_screen != nil {
+                    let win_screen: id = msg_send![win, screen];
+                    if win_screen != nil && win_screen != clicked_screen {
+                        return false;
+                    }
+                }
+                let app_active: BOOL = msg_send![app, isActive];
+                let is_key: BOOL = msg_send![win, isKeyWindow];
+                if app_active == YES || is_key == YES || is_frontmost_layer0_window_ours() {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
     extern "C" fn on_status_bar_click(_this: &Object, _cmd: Sel, _sender: id) {
-        send_tray_command(TrayCommand::ToggleWindow);
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let event: id = msg_send![app, currentEvent];
+            let is_right_click = if event != nil {
+                let event_type: u64 = msg_send![event, type];
+                let flags: u64 = msg_send![event, modifierFlags];
+                event_type == EVENT_TYPE_RIGHT_MOUSE_DOWN
+                    || event_type == EVENT_TYPE_RIGHT_MOUSE_UP
+                    || event_type == EVENT_TYPE_OTHER_MOUSE_DOWN
+                    || (flags & MODIFIER_FLAG_CONTROL) != 0
+            } else {
+                false
+            };
+
+            if is_right_click {
+                let item_ptr = STATUS_ITEM_PTR.load(Ordering::SeqCst);
+                let menu_ptr = STATUS_MENU_PTR.load(Ordering::SeqCst);
+                if item_ptr != 0 && menu_ptr != 0 {
+                    let status_item = item_ptr as id;
+                    let menu = menu_ptr as id;
+                    let _: () = msg_send![status_item, popUpStatusItemMenu: menu];
+                }
+            } else {
+                // 在 AppKit 鼠标点击事件主线程内立即同步执行窗口拉起/隐藏，确保拥有系统焦点令牌
+                let should_show = !is_window_actually_front_and_visible();
+                if std::env::var("AGENTGATE_DEBUG_TRAY").as_deref() == Ok("1") {
+                    println!("TRAY_CLICK should_show={}", should_show);
+                }
+                super::set_window_visible_flag(should_show);
+                set_visible(should_show);
+                send_tray_command(if should_show {
+                    TrayCommand::ShowWindow
+                } else {
+                    TrayCommand::HideWindow
+                });
+            }
+        }
+    }
+
+    extern "C" fn on_menu_toggle_window(_this: &Object, _cmd: Sel, _sender: id) {
+        let should_show = !is_window_actually_front_and_visible();
+        super::set_window_visible_flag(should_show);
+        set_visible(should_show);
+        send_tray_command(if should_show {
+            TrayCommand::ShowWindow
+        } else {
+            TrayCommand::HideWindow
+        });
+    }
+
+    extern "C" fn on_menu_quit_app(_this: &Object, _cmd: Sel, _sender: id) {
+        send_tray_command(TrayCommand::QuitApp);
     }
 
     fn target_class() -> &'static Class {
@@ -413,6 +638,14 @@ mod macos_tray {
                 decl.add_method(
                     sel!(onStatusBarClick:),
                     on_status_bar_click as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(onMenuToggleWindow:),
+                    on_menu_toggle_window as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(onMenuQuitApp:),
+                    on_menu_quit_app as extern "C" fn(&Object, Sel, id),
                 );
                 decl.register();
             }
@@ -431,6 +664,7 @@ mod macos_tray {
             let status_item: id = msg_send![status_bar, statusItemWithLength: 28.0_f64];
             let _: id = msg_send![status_item, retain];
             let _: () = msg_send![status_item, setVisible: YES];
+            STATUS_ITEM_PTR.store(status_item as usize, Ordering::SeqCst);
 
             // 3. 生成 36x36 (@2x Retina 对应 18x18pt) 专属双弧隔离环模版图标
             let png_bytes = generate_template_icon_png(36, [0, 0, 0]);
@@ -444,19 +678,47 @@ mod macos_tray {
             let _: () = msg_send![ns_image, setSize: NSSize::new(18.0, 18.0)];
             let _: () = msg_send![ns_image, setTemplate: YES];
 
-            // 4. 绑定图标与点击事件到 NSStatusBarButton
+            // 4. 构建右键上下文菜单（含显示/隐藏与退出按钮）
+            let target: id = msg_send![target_class(), new];
+            let _: id = msg_send![target, retain];
+
+            let menu = NSMenu::new(nil);
+            let empty_key = NSString::alloc(nil).init_str("");
+            let toggle_title = NSString::alloc(nil).init_str("显示 / 隐藏工作台");
+            let toggle_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
+                toggle_title,
+                sel!(onMenuToggleWindow:),
+                empty_key,
+            );
+            let _: () = msg_send![toggle_item, setTarget: target];
+            menu.addItem_(toggle_item);
+
+            let sep = NSMenuItem::separatorItem(nil);
+            menu.addItem_(sep);
+
+            let quit_title = NSString::alloc(nil).init_str("退出 AgentGate");
+            let quit_key = NSString::alloc(nil).init_str("q");
+            let quit_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
+                quit_title,
+                sel!(onMenuQuitApp:),
+                quit_key,
+            );
+            let _: () = msg_send![quit_item, setTarget: target];
+            menu.addItem_(quit_item);
+            STATUS_MENU_PTR.store(menu as usize, Ordering::SeqCst);
+
+            // 5. 绑定图标与左/右键点击事件到 NSStatusBarButton
             let button: id = msg_send![status_item, button];
             if button != nil {
                 let _: id = msg_send![ns_image, retain];
                 let _: () = msg_send![button, setImage: ns_image];
                 let tooltip =
-                    NSString::alloc(nil).init_str("AgentGate — 本地 SSH 安全隔离中转台 (点击显示/收起)");
+                    NSString::alloc(nil).init_str("AgentGate (左键显示/隐藏，右键打开菜单)");
                 let _: () = msg_send![button, setToolTip: tooltip];
 
-                let target: id = msg_send![target_class(), new];
-                let _: id = msg_send![target, retain];
                 let _: () = msg_send![button, setTarget: target];
                 let _: () = msg_send![button, setAction: sel!(onStatusBarClick:)];
+                let _: i64 = msg_send![button, sendActionOn: LEFT_AND_RIGHT_MOUSE_DOWN_MASK];
                 STATUS_BUTTON_PTR.store(button as usize, Ordering::SeqCst);
             }
         }
@@ -489,37 +751,48 @@ mod macos_tray {
     pub fn set_visible(visible: bool) {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
-            let _: BOOL = msg_send![
-                app,
-                setActivationPolicy: NSApplicationActivationPolicyAccessory
-            ];
+            if visible {
+                let _: () = msg_send![app, unhideWithoutActivation];
+                let running_app: id =
+                    msg_send![class!(NSRunningApplication), currentApplication];
+                if running_app != nil {
+                    let _: BOOL = msg_send![
+                        running_app,
+                        activateWithOptions: NS_APP_ACTIVATE_ALL_AND_IGNORE_OTHER
+                    ];
+                }
+                let has_activate: BOOL = msg_send![app, respondsToSelector: sel!(activate)];
+                if has_activate == YES {
+                    let _: () = msg_send![app, activate];
+                }
+                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+            }
+            let target_screen = status_button_screen();
             let windows: id = msg_send![app, windows];
             let count: usize = msg_send![windows, count];
             for i in 0..count {
                 let win: id = msg_send![windows, objectAtIndex: i];
-                let class_name: id = msg_send![win, className];
-                let c_str: *const i8 = msg_send![class_name, UTF8String];
-                let name_str = if !c_str.is_null() {
-                    std::ffi::CStr::from_ptr(c_str).to_string_lossy()
-                } else {
-                    std::borrow::Cow::Borrowed("")
-                };
-                // 仅控制 GPUI 主工作台窗口，绝不触碰 NSStatusBarWindow
-                if !name_str.contains("GPUI") {
+                if !is_gpui_main_window(win) {
                     continue;
                 }
                 if visible {
+                    let behavior: u64 = msg_send![win, collectionBehavior];
+                    let _: () = msg_send![
+                        win,
+                        setCollectionBehavior: behavior | WINDOW_COLLECTION_MOVE_TO_ACTIVE_SPACE
+                    ];
+                    let is_mini: BOOL = msg_send![win, isMiniaturized];
+                    if is_mini == YES {
+                        let _: () = msg_send![win, deminiaturize: nil];
+                    }
+                    move_window_to_screen_if_needed(win, target_screen);
                     let _: () = msg_send![win, makeKeyAndOrderFront: nil];
+                    let _: () = msg_send![win, orderFrontRegardless];
                 } else {
                     let _: () = msg_send![win, orderOut: nil];
                 }
             }
-            if visible {
-                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
-            } else {
-                let _: () = msg_send![app, hide: nil];
-                let _ = NO;
-            }
+            let _ = NO;
         }
     }
 }
@@ -529,23 +802,27 @@ mod windows_tray {
     use std::mem::size_of;
     use std::sync::atomic::{AtomicIsize, Ordering};
 
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
          NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIcon, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GWL_EXSTYLE,
-        GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowThreadProcessId, MSG,
-        RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-        TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
-        WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+        DispatchMessageW, FindWindowExW, GWL_EXSTYLE, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+        GetForegroundWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, SW_HIDE, SW_RESTORE,
+        SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
     use windows::core::PCWSTR;
 
     use super::{TrayCommand, generate_template_icon_rgba, send_tray_command};
 
     const WM_TRAYICON: u32 = WM_APP + 0x47;
+    const IDM_TOGGLE_WINDOW: usize = 1001;
+    const IDM_QUIT_APP: usize = 1002;
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
     static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -580,8 +857,47 @@ mod windows_tray {
     ) -> LRESULT {
         if msg == WM_TRAYICON {
             let event = (lparam.0 & 0xffff) as u32;
-            if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
+            if event == WM_LBUTTONUP {
                 send_tray_command(TrayCommand::ToggleWindow);
+            } else if event == WM_RBUTTONUP {
+                unsafe {
+                    if let Ok(hmenu) = CreatePopupMenu() {
+                        let toggle_text: Vec<u16> =
+                            "显示 / 隐藏工作台\0".encode_utf16().collect();
+                        let quit_text: Vec<u16> = "退出 AgentGate\0".encode_utf16().collect();
+                        let _ = AppendMenuW(
+                            hmenu,
+                            MF_STRING,
+                            IDM_TOGGLE_WINDOW,
+                            PCWSTR(toggle_text.as_ptr()),
+                        );
+                        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                        let _ = AppendMenuW(
+                            hmenu,
+                            MF_STRING,
+                            IDM_QUIT_APP,
+                            PCWSTR(quit_text.as_ptr()),
+                        );
+                        let mut pt = POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        let _ = SetForegroundWindow(hwnd);
+                        let selected = TrackPopupMenu(
+                            hmenu,
+                            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                            pt.x,
+                            pt.y,
+                            Some(0),
+                            hwnd,
+                            None,
+                        );
+                        let _ = DestroyMenu(hmenu);
+                        match selected.0 as usize {
+                            IDM_TOGGLE_WINDOW => send_tray_command(TrayCommand::ToggleWindow),
+                            IDM_QUIT_APP => send_tray_command(TrayCommand::QuitApp),
+                            _ => {}
+                        }
+                    }
+                }
             }
             return LRESULT(0);
         }
@@ -678,12 +994,29 @@ mod windows_tray {
             if raw != 0 {
                 let hwnd = HWND(raw as *mut _);
                 if visible {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        let _ = ShowWindow(hwnd, SW_SHOW);
+                    }
                     let _ = SetForegroundWindow(hwnd);
                 } else {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
             }
+        }
+    }
+
+    pub fn is_window_actually_front_and_visible() -> bool {
+        unsafe {
+            let raw = MAIN_HWND.load(Ordering::SeqCst);
+            if raw == 0 {
+                return false;
+            }
+            let hwnd = HWND(raw as *mut _);
+            IsWindowVisible(hwnd).as_bool()
+                && !IsIconic(hwnd).as_bool()
+                && GetForegroundWindow() == hwnd
         }
     }
 }

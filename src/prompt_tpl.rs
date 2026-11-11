@@ -28,6 +28,11 @@ pub fn render_agent_snippet_with_null_dev(
         .local_port()
         .ok_or_else(|| anyhow!("代号 [{}] 尚未启动本地监听，请先开启中转后再复制配置", host.codename))?;
 
+    let bind_host = if host.local_bind_host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        host.local_bind_host.trim()
+    };
     let codename = host.codename.trim();
     match format {
         CopyFormat::AgentPromptCard => match host.agent_auth_mode {
@@ -35,15 +40,19 @@ pub fn render_agent_snippet_with_null_dev(
                 let temp_pwd = runtime
                     .current_temp_password
                     .as_deref()
+                    .or({
+                        let p = host.agent_password.trim();
+                        (!p.is_empty()).then_some(p)
+                    })
                     .ok_or_else(|| anyhow!("当前未生成临时密码，请先轮换或重启该条中转"))?;
                 Ok(format!(
                     "[SSH 目标代号: {codename}]\n\
-                     Host: 127.0.0.1\n\
+                     Host: {bind_host}\n\
                      Port: {local_port}\n\
                      User: {codename}\n\
                      AuthMode: TemporaryPassword\n\
                      Password: {temp_pwd}\n\
-                     Command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@127.0.0.1"
+                     Command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@{bind_host}"
                 ))
             }
             AgentAuthMode::DedicatedKey => {
@@ -53,18 +62,18 @@ pub fn render_agent_snippet_with_null_dev(
                     .ok_or_else(|| anyhow!("当前未找到本机专用密钥文件，请重置专用密钥"))?;
                 Ok(format!(
                     "[SSH 目标代号: {codename}]\n\
-                     Host: 127.0.0.1\n\
+                     Host: {bind_host}\n\
                      Port: {local_port}\n\
                      User: {codename}\n\
                      AuthMode: DedicatedKey\n\
                      IdentityFile: {key_path}\n\
-                     Command: ssh -i \"{key_path}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@127.0.0.1"
+                     Command: ssh -i \"{key_path}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@{bind_host}"
                 ))
             }
         },
         CopyFormat::SshCommandOnly => match host.agent_auth_mode {
             AgentAuthMode::EphemeralPassword => Ok(format!(
-                "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@127.0.0.1"
+                "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@{bind_host}"
             )),
             AgentAuthMode::DedicatedKey => {
                 let key_path = runtime
@@ -72,7 +81,7 @@ pub fn render_agent_snippet_with_null_dev(
                     .as_deref()
                     .ok_or_else(|| anyhow!("当前未找到本机专用密钥文件，请重置专用密钥"))?;
                 Ok(format!(
-                    "ssh -i \"{key_path}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@127.0.0.1"
+                    "ssh -i \"{key_path}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@{bind_host}"
                 ))
             }
         },
@@ -91,6 +100,9 @@ mod tests {
             id: Uuid::new_v4(),
             codename: "jade-sentry-01".to_string(),
             label: "内网测试机".to_string(),
+            local_bind_host: "127.0.0.1".to_string(),
+            local_port: 54321,
+            agent_password: "TempAbc123-Xyz789-Qwe456".to_string(),
             real_host: "10.96.1.108".to_string(),
             real_port: 22022,
             real_user: "real_admin_user".to_string(),

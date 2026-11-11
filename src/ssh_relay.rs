@@ -118,9 +118,14 @@ pub async fn start_host_relay(
     initial_creds: LiveCredentials,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
 ) -> Result<RunningRelayControl> {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let bind_host = if host.local_bind_host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        host.local_bind_host.trim()
+    };
+    let listener = TcpListener::bind((bind_host, host.local_port))
         .await
-        .context("绑定本机 127.0.0.1 随机未占用端口失败")?;
+        .with_context(|| format!("绑定本机 {}:{} 端口失败", bind_host, host.local_port))?;
     let local_port = listener
         .local_addr()
         .context("读取本地监听端口失败")?
@@ -165,7 +170,8 @@ pub async fn start_host_relay(
         codename: codename.clone(),
         event: "本地监听已启动".to_string(),
         detail: format!(
-            "绑定 127.0.0.1:{} (代理: {})",
+            "绑定 {}:{} (代理: {})",
+            bind_host,
             local_port,
             host.proxy.badge_text()
         ),
@@ -1191,6 +1197,9 @@ mod tests {
             id: Uuid::new_v4(),
             codename: "cobalt-nexus-01".to_string(),
             label: "模拟远端测试机".to_string(),
+            local_bind_host: "127.0.0.1".to_string(),
+            local_port: 0,
+            agent_password: RelayHost::generate_ephemeral_password(),
             real_host: "127.0.0.1".to_string(),
             real_port: remote_port,
             real_user: "real_prod_root".to_string(),
@@ -1321,6 +1330,9 @@ mod tests {
             id: Uuid::new_v4(),
             codename: "cipher-harbor-05".to_string(),
             label: "生产核心节点".to_string(),
+            local_bind_host: "127.0.0.1".to_string(),
+            local_port: 0,
+            agent_password: RelayHost::generate_ephemeral_password(),
             real_host: "10.96.1.104".to_string(),
             real_port: 22,
             real_user: "prod_super_admin".to_string(),
@@ -1544,6 +1556,9 @@ mod tests {
             id: Uuid::new_v4(),
             codename: "titan-sentry-07".to_string(),
             label: "SOCKS5 全链路测试机".to_string(),
+            local_bind_host: "127.0.0.1".to_string(),
+            local_port: 0,
+            agent_password: RelayHost::generate_ephemeral_password(),
             real_host: "127.0.0.1".to_string(),
             real_port: remote_port,
             real_user: "hidden_real_root".to_string(),
@@ -1655,6 +1670,9 @@ mod tests {
             id: Uuid::new_v4(),
             codename: "tofu-guard-01".to_string(),
             label: "TOFU 测试节点".to_string(),
+            local_bind_host: "127.0.0.1".to_string(),
+            local_port: 0,
+            agent_password: RelayHost::generate_ephemeral_password(),
             real_host: "127.0.0.1".to_string(),
             real_port: remote_port,
             real_user: "root".to_string(),

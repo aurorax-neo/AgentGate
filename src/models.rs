@@ -95,6 +95,15 @@ pub struct RelayHost {
     pub codename: String,
     /// 本机可见备注（不进入 Agent 提示词）
     pub label: String,
+    /// 本机 SSH 中转监听地址（默认 127.0.0.1，可在新建/编辑弹窗中自定义）
+    #[serde(default = "RelayHost::default_local_bind_host")]
+    pub local_bind_host: String,
+    /// 本机 SSH 中转监听固定端口（新建时自动分配未占用端口并持久化，除手动修改外保持不变）
+    #[serde(default)]
+    pub local_port: u16,
+    /// 暴露给 Agent 的本地固定密码（新建时生成并持久化，除手动修改或点击轮换外保持不变）
+    #[serde(default = "RelayHost::generate_ephemeral_password")]
+    pub agent_password: String,
     /// 真实远端主机地址（IP 或域名，不进 Agent）
     pub real_host: String,
     /// 真实远端 SSH 端口
@@ -118,12 +127,37 @@ pub struct RelayHost {
 }
 
 impl RelayHost {
+    pub fn default_local_bind_host() -> String {
+        "127.0.0.1".to_string()
+    }
+
+    /// 探测并返回一个本机当前未占用的随机端口
+    pub fn allocate_free_local_port(bind_host: &str) -> u16 {
+        let host = if bind_host.trim().is_empty() {
+            "127.0.0.1"
+        } else {
+            bind_host.trim()
+        };
+        if let Ok(listener) = std::net::TcpListener::bind((host, 0))
+            && let Ok(addr) = listener.local_addr()
+        {
+            return addr.port();
+        }
+        let mut rng = rand::rng();
+        rng.random_range(20000..60000)
+    }
+
     pub fn new_template(existing_count: usize) -> Self {
         let now = Self::now_str();
+        let local_bind_host = Self::default_local_bind_host();
+        let local_port = Self::allocate_free_local_port(&local_bind_host);
         Self {
             id: Uuid::new_v4(),
             codename: Self::generate_codename(existing_count),
             label: String::new(),
+            local_bind_host,
+            local_port,
+            agent_password: Self::generate_ephemeral_password(),
             real_host: "127.0.0.1".to_string(),
             real_port: 22,
             real_user: "root".to_string(),
@@ -379,7 +413,7 @@ impl PendingAction {
     pub fn description(&self) -> String {
         match self {
             Self::StartRelay { codename, .. } => format!(
-                "将为代号 [{}] 随机分配本机 127.0.0.1 未占用端口并启动 SSH 中转服务，同时刷新本次会话凭证。真实主机地址与真实密码不会暴露。",
+                "将按代号 [{}] 已保存的本机监听地址与固定端口启动 SSH 中转服务。真实主机地址与真实密码不会暴露。",
                 codename
             ),
             Self::StopRelay {
@@ -387,19 +421,21 @@ impl PendingAction {
                 local_port,
                 ..
             } => format!(
-                "将立即关闭代号 [{}] 在 127.0.0.1:{} 上的本地监听，断开正在进行的 Agent 会话并销毁当前临时密码。",
+                "将立即关闭代号 [{}] 在端口 {} 上的本地监听并断开当前活跃会话（已保存的本机端口与密码保持不变）。",
                 codename, local_port
             ),
             Self::StopAllRelays { running_count } => format!(
-                "将立即关闭当前全部 {} 条正在运行的本地 SSH 中转监听，并吊销所有临时会话凭证。",
+                "将立即关闭当前全部 {} 条正在运行的本地 SSH 中转监听（各主机已保存的端口与密码保持不变）。",
                 running_count
             ),
             Self::SaveHost { host, is_new } => {
                 let action_word = if *is_new { "新增" } else { "更新" };
                 format!(
-                    "将{}代号为 [{}] 的主机配置（代理模式：{}，Agent 认证：{}），并使用 AES-256-GCM 加密写入本机安全仓库。",
+                    "将{}代号为 [{}] 的主机配置（本机监听：{}:{}，代理：{}，Agent 认证：{}），并使用 AES-256-GCM 加密写入本机安全仓库。",
                     action_word,
                     host.codename,
+                    host.local_bind_host,
+                    host.local_port,
                     host.proxy.badge_text(),
                     host.agent_auth_mode.label()
                 )
