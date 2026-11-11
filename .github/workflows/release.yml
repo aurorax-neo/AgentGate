@@ -99,6 +99,7 @@ jobs:
 
           if [ "${{ runner.os }}" = "macOS" ]; then
             # macOS: 组装标准 AgentGate.app 应用包并封装为可拖拽安装的 .dmg 磁盘映像
+            sudo mdutil -i off -a 2>/dev/null || true
             for MAC_TARGET in ${{ matrix.target }} ${{ matrix.extra_target }}; do
               MAC_PKG_NAME="AgentGate_${TAG_NAME}_${MAC_TARGET}"
               DMG_STAGE="${ROOT_DIR}/dmg-staging-${MAC_TARGET}"
@@ -113,11 +114,21 @@ jobs:
               codesign --force --deep --sign - "${APP_BUNDLE}"
               ln -s /Applications "${DMG_STAGE}/Applications"
 
-              hdiutil create \
-                -volname "AgentGate" \
-                -srcfolder "${DMG_STAGE}" \
-                -ov -format UDZO \
-                "${ROOT_DIR}/release-packages/${MAC_PKG_NAME}.dmg"
+              DMG_OUT="${ROOT_DIR}/release-packages/${MAC_PKG_NAME}.dmg"
+              for ATTEMPT in 1 2 3 4 5; do
+                hdiutil detach "/Volumes/AgentGate" -force 2>/dev/null || true
+                rm -f "${DMG_OUT}"
+                if hdiutil create \
+                  -volname "AgentGate" \
+                  -srcfolder "${DMG_STAGE}" \
+                  -ov -format UDZO \
+                  "${DMG_OUT}"; then
+                  break
+                fi
+                echo "hdiutil create busy on attempt ${ATTEMPT}, retrying in 4s..."
+                sleep 4
+              done
+              test -f "${DMG_OUT}"
             done
           elif [ "${{ runner.os }}" = "Windows" ]; then
             # Windows: 生成内嵌图标的无控制台 AgentGate.exe，产出 NSIS 安装包 (-setup.exe) 与便携版 (.zip)
