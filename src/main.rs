@@ -66,7 +66,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("AgentGate".into()),
-                    appears_transparent: false,
+                    appears_transparent: cfg!(not(target_os = "macos")),
                     traffic_light_position: None,
                 }),
                 focus: true,

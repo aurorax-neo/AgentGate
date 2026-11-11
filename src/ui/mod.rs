@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use gpui::{
     App, ClipboardItem, Context, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
-    MouseButton, SharedString, Stateful, Window, actions, div, hsla, prelude::*, px, rgb,
+    MouseButton, SharedString, Stateful, Window, WindowControlArea, actions, div, hsla, prelude::*,
+    px, rgb,
 };
 use russh::keys::ssh_key::PrivateKey;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,10 @@ use crate::ssh_relay::{
     LiveCredentials, RelayEvent, RunningRelayControl, global_tokio_runtime, start_host_relay,
 };
 use crate::storage::EncryptedStorage;
-use crate::tray::{TrayCommand, is_window_visible, platform_set_window_visible, poll_tray_command};
+use crate::tray::{
+    TrayCommand, is_window_visible, platform_set_window_visible, platform_toggle_maximize_window,
+    poll_tray_command,
+};
 use crate::ui::text_input::{TextField, bind_text_input_keys};
 use crate::ui::theme::WorkbenchTheme;
 
@@ -1322,10 +1326,13 @@ impl AgentGateWorkbench {
             .border_color(theme.border)
             .child(
                 div()
+                    .flex_1()
+                    .h_full()
                     .flex()
                     .items_center()
                     .gap_2p5()
                     .min_w_0()
+                    .window_control_area(WindowControlArea::Drag)
                     .child(
                         div()
                             .px_2p5()
@@ -1440,13 +1447,17 @@ impl AgentGateWorkbench {
                                 .child(
                                     window_ctrl_button("win-btn-min", "—", theme, false)
                                         .on_click(cx.listener(|_, _, window, _| {
+                                            platform_set_window_visible(false);
+                                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                                             window.minimize_window();
+                                            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                                            let _ = window;
                                         })),
                                 )
                                 .child(
                                     window_ctrl_button("win-btn-max", "□", theme, false)
                                         .on_click(cx.listener(|_, _, window, _| {
-                                            window.zoom_window();
+                                            platform_toggle_maximize_window(window);
                                         })),
                                 )
                                 .child(

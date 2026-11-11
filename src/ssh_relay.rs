@@ -562,12 +562,21 @@ impl LocalSshHandler {
                                 }
                             }
                         }
+                        let root_hint = if host.real_user == "root"
+                            && remaining_str.contains("PublicKey")
+                            && remaining_str.contains("Password")
+                        {
+                            " [排查建议: 确认 root 密码无误，或检查远端 /etc/ssh/sshd_config 是否已设置 PermitRootLogin yes（Debian/Ubuntu 默认 prohibit-password 会拒绝 root 密码登录）]"
+                        } else {
+                            ""
+                        };
                         (
                             kbd_ok,
                             format!(
-                                "password 与 keyboard-interactive 均被拒绝 (密码长度: {} 字符, 服务端返回: {})",
+                                "password 与 keyboard-interactive 均被拒绝 (密码长度: {} 字符, 服务端返回: {}){}",
                                 pwd_clean.chars().count(),
-                                sanitize_error(&remaining_str, &host)
+                                sanitize_error(&remaining_str, &host),
+                                root_hint
                             ),
                         )
                     }

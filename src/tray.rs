@@ -389,6 +389,18 @@ pub fn platform_set_window_visible(visible: bool) {
     linux_tray::set_visible(visible);
 }
 
+/// 在系统层面切换主窗口的最大化与还原状态
+pub fn platform_toggle_maximize_window(window: &gpui::Window) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = window;
+        windows_tray::toggle_maximize();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        window.zoom_window();
+    }
+}
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
 mod macos_tray {
@@ -411,6 +423,8 @@ mod macos_tray {
     static STATUS_ITEM_PTR: AtomicUsize = AtomicUsize::new(0);
     static STATUS_BUTTON_PTR: AtomicUsize = AtomicUsize::new(0);
     static STATUS_MENU_PTR: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_MENU_ACTION: AtomicUsize = AtomicUsize::new(0);
+    static WAS_VISIBLE_BEFORE_MENU: AtomicBool = AtomicBool::new(true);
     static LOGGED_FRAME: AtomicBool = AtomicBool::new(false);
 
     // NSEventMaskLeftMouseDown (1 << 1) | NSEventMaskRightMouseDown (1 << 3)
@@ -421,6 +435,8 @@ mod macos_tray {
     const EVENT_TYPE_OTHER_MOUSE_DOWN: u64 = 25;
     // NSEventModifierFlagControl = 1 << 18
     const MODIFIER_FLAG_CONTROL: u64 = 1 << 18;
+    // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1
+    const WINDOW_COLLECTION_MOVE_TO_ACTIVE_SPACE: u64 = 1 << 1;
     // NSWindowCollectionBehaviorFullScreenNone = 1 << 9 (使 Accessory 模式下的绿色按钮执行窗口最大化/还原 zoom:，而非被系统忽略的全屏空间)
     const WINDOW_COLLECTION_FULLSCREEN_NONE: u64 = 1 << 9;
     // NSWindowZoomButton = 2
@@ -440,17 +456,36 @@ mod macos_tray {
         fn CFRelease(cf: *const c_void);
     }
 
-    /// 检查 macOS WindowServer 当前屏幕上最顶层（Z 序 #0）的普通窗口（layer == 0）是否属于本进程
-    unsafe fn is_frontmost_layer0_window_ours() -> bool {
+    unsafe fn dict_f64(dict: id, key: id) -> Option<f64> {
+        if dict == nil || key == nil {
+            return None;
+        }
+        let val: id = unsafe { msg_send![dict, objectForKey: key] };
+        if val == nil {
+            return None;
+        }
+        let num: f64 = unsafe { msg_send![val, doubleValue] };
+        Some(num)
+    }
+
+    /// 检查本进程主窗口在当前活跃 Space 上是否真正对用户可见（未被同屏幕更上层的其他应用窗口遮挡）
+    unsafe fn is_our_window_unoccluded_on_screen() -> bool {
         let info_list = unsafe { CGWindowListCopyWindowInfo(CG_WINDOW_LIST_ON_SCREEN_EXCLUDE_DESKTOP, 0) };
         if info_list == nil {
             return false;
         }
         let key_layer = unsafe { NSString::alloc(nil).init_str("kCGWindowLayer") };
         let key_pid = unsafe { NSString::alloc(nil).init_str("kCGWindowOwnerPID") };
+        let key_bounds = unsafe { NSString::alloc(nil).init_str("kCGWindowBounds") };
+        let key_x = unsafe { NSString::alloc(nil).init_str("X") };
+        let key_y = unsafe { NSString::alloc(nil).init_str("Y") };
+        let key_w = unsafe { NSString::alloc(nil).init_str("Width") };
+        let key_h = unsafe { NSString::alloc(nil).init_str("Height") };
+
         let count: usize = unsafe { msg_send![info_list, count] };
         let my_pid = std::process::id() as i64;
-        let mut result = false;
+        let mut upper_rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+        let mut our_rect: Option<(f64, f64, f64, f64)> = None;
 
         for i in 0..count {
             let dict: id = unsafe { msg_send![info_list, objectAtIndex: i] };
@@ -466,17 +501,55 @@ mod macos_tray {
                 continue;
             }
             let pid_obj: id = unsafe { msg_send![dict, objectForKey: key_pid] };
-            if pid_obj != nil {
-                let owner_pid: i64 = unsafe { msg_send![pid_obj, integerValue] };
-                result = owner_pid == my_pid;
+            if pid_obj == nil {
+                continue;
             }
-            break;
+            let owner_pid: i64 = unsafe { msg_send![pid_obj, integerValue] };
+            let bounds_dict: id = unsafe { msg_send![dict, objectForKey: key_bounds] };
+            let Some(x) = (unsafe { dict_f64(bounds_dict, key_x) }) else {
+                continue;
+            };
+            let Some(y) = (unsafe { dict_f64(bounds_dict, key_y) }) else {
+                continue;
+            };
+            let Some(w) = (unsafe { dict_f64(bounds_dict, key_w) }) else {
+                continue;
+            };
+            let Some(h) = (unsafe { dict_f64(bounds_dict, key_h) }) else {
+                continue;
+            };
+            if w < 80.0 || h < 80.0 {
+                continue;
+            }
+            if owner_pid == my_pid {
+                our_rect = Some((x, y, w, h));
+                break;
+            } else {
+                upper_rects.push((x, y, w, h));
+            }
         }
 
         let _: () = unsafe { msg_send![key_layer, release] };
         let _: () = unsafe { msg_send![key_pid, release] };
+        let _: () = unsafe { msg_send![key_bounds, release] };
+        let _: () = unsafe { msg_send![key_x, release] };
+        let _: () = unsafe { msg_send![key_y, release] };
+        let _: () = unsafe { msg_send![key_w, release] };
+        let _: () = unsafe { msg_send![key_h, release] };
         unsafe { CFRelease(info_list as *const c_void) };
-        result
+
+        let Some((ax, ay, aw, ah)) = our_rect else {
+            return false;
+        };
+        let our_area = (aw * ah).max(1.0);
+        for (bx, by, bw, bh) in upper_rects {
+            let ix = (ax + aw).min(bx + bw) - ax.max(bx);
+            let iy = (ay + ah).min(by + bh) - ay.max(by);
+            if ix > 0.0 && iy > 0.0 && (ix * iy) >= our_area * 0.15 {
+                return false;
+            }
+        }
+        true
     }
 
     unsafe fn is_gpui_main_window(win: id) -> bool {
@@ -500,8 +573,14 @@ mod macos_tray {
         if win == nil {
             return;
         }
+        let behavior: u64 = unsafe { msg_send![win, collectionBehavior] };
         let _: () = unsafe {
-            msg_send![win, setCollectionBehavior: WINDOW_COLLECTION_FULLSCREEN_NONE]
+            msg_send![
+                win,
+                setCollectionBehavior: behavior
+                    | WINDOW_COLLECTION_MOVE_TO_ACTIVE_SPACE
+                    | WINDOW_COLLECTION_FULLSCREEN_NONE
+            ]
         };
         let zoom_btn: id = unsafe { msg_send![win, standardWindowButton: NS_WINDOW_ZOOM_BUTTON] };
         if zoom_btn != nil {
@@ -511,28 +590,7 @@ mod macos_tray {
         }
     }
 
-    /// 检测主窗口当前是否处于显示且未最小化状态（供右键菜单「显示/隐藏工作台」使用，不受菜单自身焦点影响）
-    pub fn is_window_currently_shown() -> bool {
-        unsafe {
-            let app = NSApplication::sharedApplication(nil);
-            let windows: id = msg_send![app, windows];
-            let count: usize = msg_send![windows, count];
-            for i in 0..count {
-                let win: id = msg_send![windows, objectAtIndex: i];
-                if !is_gpui_main_window(win) {
-                    continue;
-                }
-                let is_vis: BOOL = msg_send![win, isVisible];
-                let is_mini: BOOL = msg_send![win, isMiniaturized];
-                if is_vis == YES && is_mini == NO {
-                    return true;
-                }
-            }
-            false
-        }
-    }
-
-    /// 实时检测 GPUI 主窗口当前是否真正可见且处于屏幕最顶层（供左键点击图标智能拉起/收起使用）
+    /// 实时检测 GPUI 主窗口当前是否真正可见且未被遮挡（兼容多显示器与右键菜单）
     pub fn is_window_actually_front_and_visible() -> bool {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
@@ -548,9 +606,7 @@ mod macos_tray {
                 if is_vis == NO || is_mini == YES {
                     return false;
                 }
-                let app_active: BOOL = msg_send![app, isActive];
-                let is_key: BOOL = msg_send![win, isKeyWindow];
-                if app_active == YES || is_key == YES || is_frontmost_layer0_window_ours() {
+                if is_our_window_unoccluded_on_screen() {
                     return true;
                 }
             }
@@ -576,6 +632,9 @@ mod macos_tray {
             if is_right_click {
                 let menu_ptr = STATUS_MENU_PTR.load(Ordering::SeqCst);
                 if menu_ptr != 0 {
+                    let was_vis = is_window_actually_front_and_visible();
+                    WAS_VISIBLE_BEFORE_MENU.store(was_vis, Ordering::SeqCst);
+                    PENDING_MENU_ACTION.store(0, Ordering::SeqCst);
                     let menu = menu_ptr as id;
                     // 使用鼠标当前全局屏幕坐标弹出右键菜单（inView: nil），确保菜单始终在鼠标所在屏幕弹出，绝不跳回窗口所在屏幕
                     let mouse_loc: cocoa::foundation::NSPoint =
@@ -586,6 +645,23 @@ mod macos_tray {
                         atLocation: mouse_loc
                         inView: nil
                     ];
+                    // 在模态菜单完全关闭退出后再执行显隐切换或退出，避免被 NSMenu 模态循环回收焦点覆盖
+                    match PENDING_MENU_ACTION.swap(0, Ordering::SeqCst) {
+                        1 => {
+                            let should_show = !was_vis;
+                            super::set_window_visible_flag(should_show);
+                            set_visible(should_show);
+                            send_tray_command(if should_show {
+                                TrayCommand::ShowWindow
+                            } else {
+                                TrayCommand::HideWindow
+                            });
+                        }
+                        2 => {
+                            send_tray_command(TrayCommand::QuitApp);
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 // 在 AppKit 鼠标点击事件主线程内立即同步执行窗口拉起/隐藏，确保拥有系统焦点令牌
@@ -602,8 +678,8 @@ mod macos_tray {
     }
 
     extern "C" fn on_menu_toggle_window(_this: &Object, _cmd: Sel, _sender: id) {
-        // 右键菜单弹出期间菜单自身持有焦点，因此直接按窗口当前是否可见切换显隐
-        let should_show = !is_window_currently_shown();
+        PENDING_MENU_ACTION.store(1, Ordering::SeqCst);
+        let should_show = !WAS_VISIBLE_BEFORE_MENU.load(Ordering::SeqCst);
         super::set_window_visible_flag(should_show);
         set_visible(should_show);
         send_tray_command(if should_show {
@@ -614,6 +690,7 @@ mod macos_tray {
     }
 
     extern "C" fn on_menu_quit_app(_this: &Object, _cmd: Sel, _sender: id) {
+        PENDING_MENU_ACTION.store(2, Ordering::SeqCst);
         send_tray_command(TrayCommand::QuitApp);
     }
 
@@ -737,22 +814,6 @@ mod macos_tray {
     pub fn set_visible(visible: bool) {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
-            if visible {
-                let _: () = msg_send![app, unhideWithoutActivation];
-                let running_app: id =
-                    msg_send![class!(NSRunningApplication), currentApplication];
-                if running_app != nil {
-                    let _: BOOL = msg_send![
-                        running_app,
-                        activateWithOptions: NS_APP_ACTIVATE_ALL_AND_IGNORE_OTHER
-                    ];
-                }
-                let has_activate: BOOL = msg_send![app, respondsToSelector: sel!(activate)];
-                if has_activate == YES {
-                    let _: () = msg_send![app, activate];
-                }
-                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
-            }
             let windows: id = msg_send![app, windows];
             let count: usize = msg_send![windows, count];
             for i in 0..count {
@@ -772,6 +833,22 @@ mod macos_tray {
                     let _: () = msg_send![win, orderOut: nil];
                 }
             }
+            if visible {
+                let _: () = msg_send![app, unhideWithoutActivation];
+                let running_app: id =
+                    msg_send![class!(NSRunningApplication), currentApplication];
+                if running_app != nil {
+                    let _: BOOL = msg_send![
+                        running_app,
+                        activateWithOptions: NS_APP_ACTIVATE_ALL_AND_IGNORE_OTHER
+                    ];
+                }
+                let has_activate: BOOL = msg_send![app, respondsToSelector: sel!(activate)];
+                if has_activate == YES {
+                    let _: () = msg_send![app, activate];
+                }
+                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+            }
             let _ = NO;
         }
     }
@@ -781,6 +858,8 @@ mod macos_tray {
 mod windows_tray {
     use std::mem::size_of;
     use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::OnceLock;
+    use std::thread::ThreadId;
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -789,43 +868,70 @@ mod windows_tray {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DispatchMessageW, FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetCursorPos,
-        GetMessageW, GetWindowLongPtrW,
-        GetForegroundWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, SW_HIDE, SW_RESTORE,
-        SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+        DispatchMessageW, FindWindowExW, GWL_EXSTYLE, GetCursorPos,
+        GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
+        IsIconic, IsWindow, IsWindowVisible, IsZoomed, MF_SEPARATOR,
+        MF_STRING, MSG, RegisterClassW, SW_HIDE, SW_MAXIMIZE, SW_NORMAL, SW_RESTORE, SW_SHOW,
+        SetForegroundWindow, SetWindowLongPtrW, ShowWindow, ShowWindowAsync, TPM_NONOTIFY, TPM_RETURNCMD,
         TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
     use windows::core::PCWSTR;
 
-    use super::{TrayCommand, generate_template_icon_rgba, send_tray_command};
+    use super::{
+        TrayCommand, generate_template_icon_rgba, send_tray_command, set_window_visible_flag,
+    };
 
     const WM_TRAYICON: u32 = WM_APP + 0x47;
     const IDM_TOGGLE_WINDOW: usize = 1001;
     const IDM_QUIT_APP: usize = 1002;
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
     static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
 
+    fn is_on_main_window_thread() -> bool {
+        TRAY_THREAD_ID.get() != Some(&std::thread::current().id())
+    }
+
+    /// 精确按 GPUI 注册的窗口类名 `Zed::Window` 与标题 `AgentGate` 查找主窗口，绝不误匹配系统内置 `Default IME` 窗口
     unsafe fn find_process_main_window() -> Option<HWND> {
+        let cached = MAIN_HWND.load(Ordering::SeqCst);
+        if cached != 0 {
+            let hwnd = HWND(cached as *mut _);
+            if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+                return Some(hwnd);
+            }
+            MAIN_HWND.store(0, Ordering::SeqCst);
+        }
+
         let current_pid = std::process::id();
-        let tray_raw = TRAY_HWND.load(Ordering::SeqCst);
+        let class_name: Vec<u16> = "Zed::Window\0".encode_utf16().collect();
+        let win_name: Vec<u16> = "AgentGate\0".encode_utf16().collect();
         let mut cursor = HWND::default();
-        while let Ok(candidate) = unsafe { FindWindowExW(None, Some(cursor), None, None) } {
-            if candidate.0.is_null() {
+        while let Ok(found) = unsafe {
+            FindWindowExW(
+                None,
+                Some(cursor),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(win_name.as_ptr()),
+            )
+        } {
+            if found.0.is_null() {
                 break;
             }
-            cursor = candidate;
-            if candidate.0 as isize == tray_raw {
-                continue;
-            }
+            cursor = found;
             let mut win_pid = 0u32;
             unsafe {
-                GetWindowThreadProcessId(candidate, Some(&mut win_pid));
+                GetWindowThreadProcessId(found, Some(&mut win_pid));
             }
-            if win_pid == current_pid && unsafe { GetWindowTextLengthW(candidate) } > 0 {
-                return Some(candidate);
+            if win_pid == current_pid {
+                let raw = found.0 as isize;
+                MAIN_HWND.store(raw, Ordering::SeqCst);
+                // 移除任务栏图标（配合 appears_transparent: true 无外层原生标题栏）
+                let ex = unsafe { GetWindowLongPtrW(found, GWL_EXSTYLE) };
+                let new_ex = (ex & !(WS_EX_APPWINDOW.0 as isize)) | (WS_EX_TOOLWINDOW.0 as isize);
+                let _ = unsafe { SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex) };
+                return Some(found);
             }
         }
         None
@@ -840,7 +946,14 @@ mod windows_tray {
         if msg == WM_TRAYICON {
             let event = (lparam.0 & 0xffff) as u32;
             if event == WM_LBUTTONUP {
-                send_tray_command(TrayCommand::ToggleWindow);
+                let should_show = !is_window_currently_shown();
+                set_window_visible_flag(should_show);
+                set_visible(should_show);
+                send_tray_command(if should_show {
+                    TrayCommand::ShowWindow
+                } else {
+                    TrayCommand::HideWindow
+                });
             } else if event == WM_RBUTTONUP {
                 unsafe {
                     if let Ok(hmenu) = CreatePopupMenu() {
@@ -876,6 +989,8 @@ mod windows_tray {
                         match selected.0 as usize {
                             IDM_TOGGLE_WINDOW => {
                                 let should_show = !is_window_currently_shown();
+                                set_window_visible_flag(should_show);
+                                set_visible(should_show);
                                 send_tray_command(if should_show {
                                     TrayCommand::ShowWindow
                                 } else {
@@ -895,6 +1010,7 @@ mod windows_tray {
 
     pub fn install() {
         std::thread::spawn(|| unsafe {
+            let _ = TRAY_THREAD_ID.set(std::thread::current().id());
             let instance = GetModuleHandleW(None).unwrap_or_default();
             let class_name: Vec<u16> = "AgentGateTrayHostClass\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -968,71 +1084,58 @@ mod windows_tray {
 
     pub fn set_visible(visible: bool) {
         unsafe {
-            let mut raw = MAIN_HWND.load(Ordering::SeqCst);
-            if raw == 0 {
-                if let Some(found) = find_process_main_window() {
-                    raw = found.0 as isize;
-                    MAIN_HWND.store(raw, Ordering::SeqCst);
-                    // 保留完整原生标题栏与最小化/最大化/关闭按钮，同时将隐藏托盘窗口设为 Owner 以隐藏任务栏图标
-                    let style = GetWindowLongPtrW(found, GWL_STYLE);
-                    let full_style = style
-                        | (WS_CAPTION.0 as isize)
-                        | (WS_SYSMENU.0 as isize)
-                        | (WS_THICKFRAME.0 as isize)
-                        | (WS_MINIMIZEBOX.0 as isize)
-                        | (WS_MAXIMIZEBOX.0 as isize);
-                    let _ = SetWindowLongPtrW(found, GWL_STYLE, full_style);
-                    let ex = GetWindowLongPtrW(found, GWL_EXSTYLE);
-                    let new_ex = ex & !(WS_EX_APPWINDOW.0 as isize) & !(WS_EX_TOOLWINDOW.0 as isize);
-                    let _ = SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex);
-                    let tray_raw = TRAY_HWND.load(Ordering::SeqCst);
-                    if tray_raw != 0 {
-                        let _ = SetWindowLongPtrW(found, GWLP_HWNDPARENT, tray_raw);
-                    }
-                }
-            }
-            if raw != 0 {
-                let hwnd = HWND(raw as *mut _);
+            if let Some(hwnd) = find_process_main_window() {
+                let same_thread = is_on_main_window_thread();
                 if visible {
                     if IsIconic(hwnd).as_bool() {
-                        let _ = ShowWindow(hwnd, SW_RESTORE);
-                    } else {
+                        if same_thread {
+                            let _ = ShowWindow(hwnd, SW_RESTORE);
+                        } else {
+                            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                        }
+                    } else if same_thread {
                         let _ = ShowWindow(hwnd, SW_SHOW);
+                    } else {
+                        let _ = ShowWindowAsync(hwnd, SW_SHOW);
                     }
                     let _ = SetForegroundWindow(hwnd);
-                } else {
+                } else if same_thread {
                     let _ = ShowWindow(hwnd, SW_HIDE);
+                } else {
+                    let _ = ShowWindowAsync(hwnd, SW_HIDE);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_maximize() {
+        unsafe {
+            if let Some(hwnd) = find_process_main_window() {
+                let same_thread = is_on_main_window_thread();
+                if IsZoomed(hwnd).as_bool() {
+                    if same_thread {
+                        let _ = ShowWindow(hwnd, SW_NORMAL);
+                    } else {
+                        let _ = ShowWindowAsync(hwnd, SW_NORMAL);
+                    }
+                } else if same_thread {
+                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                } else {
+                    let _ = ShowWindowAsync(hwnd, SW_MAXIMIZE);
                 }
             }
         }
     }
 
     pub fn is_window_actually_front_and_visible() -> bool {
-        unsafe {
-            let raw = MAIN_HWND.load(Ordering::SeqCst);
-            if raw == 0 {
-                return false;
-            }
-            let hwnd = HWND(raw as *mut _);
-            IsWindowVisible(hwnd).as_bool()
-                && !IsIconic(hwnd).as_bool()
-                && GetForegroundWindow() == hwnd
-        }
+        is_window_currently_shown()
     }
 
     pub fn is_window_currently_shown() -> bool {
         unsafe {
-            let mut raw = MAIN_HWND.load(Ordering::SeqCst);
-            if raw == 0
-                && let Some(found) = find_process_main_window()
-            {
-                raw = found.0 as isize;
-                MAIN_HWND.store(raw, Ordering::SeqCst);
-            }
-            if raw == 0 {
+            let Some(hwnd) = find_process_main_window() else {
                 return false;
-            }
-            let hwnd = HWND(raw as *mut _);
+            };
             IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
         }
     }

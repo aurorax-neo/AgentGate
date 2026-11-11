@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-11
+
+### 🐛 Bug Fixes
+- 修复 Windows 端出现内外两套窗口控制按钮的问题：开启 `TitlebarOptions::appears_transparent` 隐藏 Windows 外层原生标题栏，仅保留内部工作台顶栏控制按钮，并为顶栏空白区域绑定 `WindowControlArea::Drag` 原生拖拽与双击最大化/还原
+- 修复 Windows 端内部顶栏关闭（`×`）、最小化（`—`）、最大化/还原（`□`）及系统托盘「显示 / 隐藏工作台」点击无效的问题：按 `Zed::Window` 类名 + `AgentGate` 标题 + 当前进程 PID 精确查找主窗口（彻底排除系统 `Default IME` 隐藏窗口干扰），并使用 `IsZoomed` 支持最大化与还原双向切换
+- 修复 macOS 与 Windows 端菜单栏 / 托盘「显示 / 隐藏工作台」在多显示器或窗口被同屏其他应用遮挡时切换失效的问题：基于 `CGWindowListCopyWindowInfo` 计算同屏上层窗口实际遮挡面积，并在模态右键菜单关闭前后同步执行窗口显隐与激活
+- 增强上游 `root` 账号密码被拒时的诊断提示，明确提示排查远端 `/etc/ssh/sshd_config` 的 `PermitRootLogin yes` 配置
+
 ## [0.1.3] - 2026-11-11
 
 ### 🚀 Features
