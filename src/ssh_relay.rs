@@ -10,11 +10,12 @@ use bytes::Bytes;
 use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key};
 use russh::server::{
-    Auth, Msg as ServerMsg, PublicKeyOffer, Session as ServerSession, VerifiedPublicKey,
+    Auth, Msg as ServerMsg, PublicKeyOffer, Response as KbdResponse, Session as ServerSession,
+    VerifiedPublicKey,
 };
 use russh::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelReadHalf, ChannelWriteHalf,
-    Disconnect, MethodSet, Preferred, Pty, Sig, SshId, client, server,
+    Disconnect, MethodKind, MethodSet, Preferred, Pty, Sig, SshId, client, server,
 };
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
@@ -140,7 +141,13 @@ pub async fn start_host_relay(
 
     let mut server_cfg = server::Config {
         server_id: SshId::Standard(Cow::Borrowed("SSH-2.0-AgentGate_LocalRelay")),
-        methods: MethodSet::server_supported(),
+        methods: MethodSet::from(
+            &[
+                MethodKind::Password,
+                MethodKind::PublicKey,
+                MethodKind::KeyboardInteractive,
+            ][..],
+        ),
         auth_rejection_time: Duration::from_millis(80),
         auth_rejection_time_initial: Some(Duration::from_millis(0)),
         keys: vec![host_key],
@@ -679,6 +686,7 @@ impl LocalSshHandler {
 
     fn spawn_upstream_to_local_bridge(
         mut upstream_read: ChannelReadHalf,
+        local_write: ChannelWriteHalf<ServerMsg>,
         server_handle: server::Handle,
         local_id: ChannelId,
         channels: Arc<AsyncMutex<HashMap<ChannelId, Arc<ChannelWriteHalf<client::Msg>>>>>,
@@ -687,23 +695,17 @@ impl LocalSshHandler {
             while let Some(msg) = upstream_read.wait().await {
                 match msg {
                     ChannelMsg::Data { data } => {
-                        if server_handle.data(local_id, data).await.is_err() {
+                        if local_write.data_bytes(data).await.is_err() {
                             break;
                         }
                     }
                     ChannelMsg::ExtendedData { data, ext } => {
-                        if server_handle
-                            .extended_data(local_id, ext, data)
-                            .await
-                            .is_err()
-                        {
+                        if local_write.extended_data_bytes(ext, data).await.is_err() {
                             break;
                         }
                     }
                     ChannelMsg::ExitStatus { exit_status } => {
-                        let _ = server_handle
-                            .exit_status_request(local_id, exit_status)
-                            .await;
+                        let _ = local_write.exit_status(exit_status).await;
                     }
                     ChannelMsg::ExitSignal {
                         signal_name,
@@ -727,10 +729,10 @@ impl LocalSshHandler {
                             .await;
                     }
                     ChannelMsg::Eof => {
-                        let _ = server_handle.eof(local_id).await;
+                        let _ = local_write.eof().await;
                     }
                     ChannelMsg::Close => {
-                        let _ = server_handle.close(local_id).await;
+                        let _ = local_write.close().await;
                         break;
                     }
                     _ => {}
@@ -800,6 +802,40 @@ impl server::Handler for LocalSshHandler {
                 true,
             );
             Ok(Auth::reject())
+        }
+    }
+
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        _submethods: &str,
+        response: Option<KbdResponse<'a>>,
+    ) -> Result<Auth, Self::Error> {
+        if !self.is_valid_agent_user(user) {
+            return Ok(Auth::reject());
+        }
+        let is_pwd_mode = self
+            .live_creds
+            .read()
+            .ok()
+            .is_some_and(|c| c.mode == AgentAuthMode::EphemeralPassword);
+        if !is_pwd_mode {
+            return Ok(Auth::reject());
+        }
+        match response {
+            None => Ok(Auth::Partial {
+                name: Cow::Borrowed(""),
+                instructions: Cow::Borrowed(""),
+                prompts: Cow::Borrowed(&[(Cow::Borrowed("Password: "), false)]),
+            }),
+            Some(mut resp) => {
+                let entered = resp
+                    .next()
+                    .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(str::to_string))
+                    .unwrap_or_default()
+                    ;
+                self.auth_password(user, &entered).await
+            }
         }
     }
 
@@ -911,7 +947,8 @@ impl server::Handler for LocalSshHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         let local_id = channel.id();
-        drop(channel);
+        let (local_read, local_write) = channel.split();
+        drop(local_read);
         let host = self.current_host();
 
         let upstream = match self.ensure_upstream().await {
@@ -934,6 +971,7 @@ impl server::Handler for LocalSshHandler {
                 reply.accept().await;
                 Self::spawn_upstream_to_local_bridge(
                     upstream_read,
+                    local_write,
                     session.handle(),
                     local_id,
                     self.channels.clone(),
@@ -979,6 +1017,21 @@ impl server::Handler for LocalSshHandler {
         Ok(())
     }
 
+    async fn channel_open_x11(
+        &mut self,
+        channel: Channel<ServerMsg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        drop(channel);
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -1012,6 +1065,20 @@ impl server::Handler for LocalSshHandler {
         } else {
             let _ = session.channel_failure(channel);
         }
+        Ok(())
+    }
+
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        // 显式返回 CHANNEL_FAILURE 拒绝 X11 转发请求，防止 MobaXterm / PuTTY 因等待 x11-req 回复而吞掉后续 shell 的 CHANNEL_SUCCESS 导致终端卡死
+        let _ = session.channel_failure(channel);
         Ok(())
     }
 
@@ -1108,6 +1175,8 @@ impl server::Handler for LocalSshHandler {
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await;
             let _ = session.channel_success(channel);
+        } else {
+            let _ = session.channel_failure(channel);
         }
         Ok(())
     }
@@ -2074,6 +2143,48 @@ mod tests {
             tcpip_res.is_err(),
             "Agent 发起的 direct-tcpip 端口转发必须被默认拦截"
         );
+
+        // 模拟 MobaXterm 连接序列：在同一会话通道连续发送 pty-req (want_reply=1) -> x11-req (want_reply=1) -> shell (want_reply=1)
+        // 验证 x11-req 立即返回 CHANNEL_FAILURE，不会吞掉后续 shell 的 CHANNEL_SUCCESS，且交互式输入输出不卡死
+        let mut moba_chan = sess
+            .channel_open_session()
+            .await
+            .expect("open mobaxterm session");
+        moba_chan
+            .request_pty(true, "xterm", 120, 36, 0, 0, &[])
+            .await
+            .expect("moba pty-req");
+        moba_chan
+            .request_x11(true, false, "MIT-MAGIC-COOKIE-1", "0123456789abcdef", 0)
+            .await
+            .expect("moba x11-req");
+        moba_chan
+            .request_shell(true)
+            .await
+            .expect("moba shell-req");
+        moba_chan
+            .data(&b"moba_cmd_ok\nexit\n"[..])
+            .await
+            .expect("moba send input");
+
+        let mut seen_success = 0usize;
+        let mut seen_failure = 0usize;
+        let mut moba_out = Vec::new();
+        while let Some(msg) = timeout(Duration::from_secs(3), moba_chan.wait())
+            .await
+            .expect("MobaXterm sequence should not hang")
+        {
+            match msg {
+                ChannelMsg::Success => seen_success += 1,
+                ChannelMsg::Failure => seen_failure += 1,
+                ChannelMsg::Data { data } => moba_out.extend_from_slice(&data),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(seen_success, 2, "pty-req and shell must both receive CHANNEL_SUCCESS");
+        assert_eq!(seen_failure, 1, "x11-req must explicitly receive CHANNEL_FAILURE");
+        assert!(String::from_utf8_lossy(&moba_out).contains("ECHO:moba_cmd_ok"));
 
         control.stop();
     }

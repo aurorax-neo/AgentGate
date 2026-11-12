@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-12
+
+### 🚀 Features
+- **增强左侧主机列表选中态视觉辨识度**：选中条目启用 4px 亮青色左边框、全周强调色描边、高对比度青绿着色底色（悬停保持高亮）、代号文字亮色突出及「当前」实心胶囊徽标，深浅色主题下一眼可辨
+
+### 🐛 Bug Fixes
+- **修复 MobaXterm 连接本地中转后终端命令行卡死的问题**：在 `LocalSshHandler` 中显式实现 `x11_request`（立即返回 `CHANNEL_FAILURE`）与 `channel_open_x11`，防止 MobaXterm 默认发送的 `x11-req` 因无响应而错配吞掉后续 `shell` 的 `CHANNEL_SUCCESS`；同时将本地通道升级为带独立窗口流控的 `ChannelWriteHalf<ServerMsg>`，并补齐本地服务端 `keyboard-interactive` 认证支持
+- **修复 Windows 下无法拖动窗口调整位置的问题**：将 `.track_focus` 从包裹顶栏的外层根容器下移至工作区主体容器，消除点击顶栏拖拽区时触发 `window.prevent_default()` 吞掉 `WM_NCLBUTTONDOWN (HTCAPTION)` 的问题，并为整条顶栏空白区开启原生拖拽与双击最大化/还原
+
 ## [0.1.7] - 2026-11-12
 
 ### 🛡️ Security

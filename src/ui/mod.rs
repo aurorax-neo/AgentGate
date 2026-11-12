@@ -1382,6 +1382,7 @@ impl AgentGateWorkbench {
             .bg(theme.bg_surface)
             .border_b_1()
             .border_color(theme.border)
+            .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
                     .flex_1()
@@ -1449,6 +1450,7 @@ impl AgentGateWorkbench {
             )
             .child(
                 div()
+                    .occlude()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1605,27 +1607,44 @@ impl AgentGateWorkbench {
                             host.local_bind_host.trim()
                         };
 
-                        let row_bg = if is_selected {
-                            theme.bg_subtle
+                        let selected_bg = if theme.is_dark {
+                            hsla(0.48, 0.78, 0.42, 0.24)
                         } else {
-                            theme.bg_surface
+                            hsla(0.48, 0.85, 0.34, 0.15)
+                        };
+                        let selected_hover_bg = if theme.is_dark {
+                            hsla(0.48, 0.78, 0.45, 0.28)
+                        } else {
+                            hsla(0.48, 0.85, 0.34, 0.19)
+                        };
+                        let accent_edge = if theme.is_dark {
+                            theme.accent_hover
+                        } else {
+                            theme.accent
                         };
 
-                        div()
+                        let row_base = div()
                             .id(("host-row", idx))
                             .w_full()
+                            .relative()
                             .px_3()
-                            .py_2p5()
-                            .bg(row_bg)
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .border_l_2()
-                            .border_color(if is_selected {
-                                theme.accent
-                            } else {
-                                theme.border
-                            })
-                            .hover(|s| s.bg(theme.bg_elevated))
+                            .py_2p5();
+                        let row_styled = if is_selected {
+                            row_base
+                                .bg(selected_bg)
+                                .border_1()
+                                .border_l_4()
+                                .border_color(accent_edge)
+                                .hover(move |s| s.bg(selected_hover_bg))
+                        } else {
+                            row_base
+                                .bg(theme.bg_surface)
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .hover(|s| s.bg(theme.bg_elevated))
+                        };
+
+                        row_styled
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_host_id = Some(id);
@@ -1659,9 +1678,28 @@ impl AgentGateWorkbench {
                                                 div()
                                                     .text_size(px(13.5))
                                                     .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(theme.text_primary)
+                                                    .text_color(if is_selected {
+                                                        accent_edge
+                                                    } else {
+                                                        theme.text_primary
+                                                    })
                                                     .child(format!("[{}]", host.codename)),
-                                            ),
+                                            )
+                                            .when(is_selected, |el| {
+                                                el.child(
+                                                    div()
+                                                        .px_1p5()
+                                                        .h(px(17.))
+                                                        .rounded(px(3.))
+                                                        .bg(accent_edge)
+                                                        .text_color(rgb(0xffffff))
+                                                        .text_size(px(10.))
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .flex()
+                                                        .items_center()
+                                                        .child("当前"),
+                                                )
+                                            }),
                                     )
                                     .child({
                                         let codename_toggle = codename.clone();
@@ -3425,7 +3463,6 @@ impl Render for AgentGateWorkbench {
 
         div()
             .id("agentgate-root")
-            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_confirm_modal_action))
             .on_action(cx.listener(Self::on_cancel_modal_action))
             .on_action(|_: &HideToTrayAction, window: &mut Window, _cx: &mut App| {
@@ -3450,20 +3487,23 @@ impl Render for AgentGateWorkbench {
             .child(self.render_top_bar(theme, cx))
             .child(
                 div()
+                    .id("agentgate-workspace-body")
+                    .track_focus(&self.focus_handle)
                     .flex_1()
                     .w_full()
+                    .relative()
                     .overflow_hidden()
                     .flex()
                     .flex_row()
                     .child(self.render_left_host_list(theme, cx))
-                    .child(self.render_right_workspace(theme, cx)),
+                    .child(self.render_right_workspace(theme, cx))
+                    .when(self.show_host_modal, |body| {
+                        body.child(self.render_host_modal(theme, cx))
+                    })
+                    .when_some(self.pending_confirm.clone(), |body, pending| {
+                        body.child(self.render_confirm_modal(&pending, theme, cx))
+                    }),
             )
-            .when(self.show_host_modal, |root| {
-                root.child(self.render_host_modal(theme, cx))
-            })
-            .when_some(self.pending_confirm.clone(), |root, pending| {
-                root.child(self.render_confirm_modal(&pending, theme, cx))
-            })
     }
 }
 
