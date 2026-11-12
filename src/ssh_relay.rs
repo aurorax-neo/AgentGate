@@ -112,18 +112,15 @@ impl RunningRelayControl {
     }
 }
 
-/// 启动单条主机的本地随机端口 SSH 中转服务（仅绑定 127.0.0.1:0）
+/// 启动单条主机的本地 SSH 中转服务（强制仅允许绑定本机回环地址，修复 [HIGH-02]）
 pub async fn start_host_relay(
     host: RelayHost,
     initial_creds: LiveCredentials,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
 ) -> Result<RunningRelayControl> {
-    let bind_host = if host.local_bind_host.trim().is_empty() {
-        "127.0.0.1"
-    } else {
-        host.local_bind_host.trim()
-    };
-    let listener = TcpListener::bind((bind_host, host.local_port))
+    let bind_host = RelayHost::validate_loopback_bind_host(&host.local_bind_host)
+        .map_err(|e| anyhow!("{}", e))?;
+    let listener = TcpListener::bind((bind_host.as_str(), host.local_port))
         .await
         .with_context(|| format!("绑定本机 {}:{} 端口失败", bind_host, host.local_port))?;
     let local_port = listener
@@ -131,8 +128,15 @@ pub async fn start_host_relay(
         .context("读取本地监听端口失败")?
         .port();
 
-    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-        .context("生成本地 SSH 服务端主机密钥失败")?;
+    // 基于主机条目唯一 ID 确定性派生本地 SSH 服务端 Ed25519 主机密钥，避免重启后本地指纹频繁变更（修复 [VERIFY-03]）
+    let seed_digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("AgentGate::LocalServerHostKey::v1::{}", host.id).as_bytes(),
+    );
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(seed_digest.as_ref());
+    let ed_keypair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
+    let host_key = PrivateKey::from(ed_keypair);
 
     let mut server_cfg = server::Config {
         server_id: SshId::Standard(Cow::Borrowed("SSH-2.0-AgentGate_LocalRelay")),
@@ -957,51 +961,21 @@ impl server::Handler for LocalSshHandler {
         originator_address: &str,
         originator_port: u32,
         reply: server::ChannelOpenHandle,
-        session: &mut ServerSession,
+        _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let local_id = channel.id();
         drop(channel);
-
-        let upstream = match self.ensure_upstream().await {
-            Ok(u) => u,
-            Err(_) => {
-                reply.reject(ChannelOpenFailure::ConnectFailed).await;
-                return Ok(());
-            }
-        };
-
-        match upstream
-            .channel_open_direct_tcpip(
-                host_to_connect,
-                port_to_connect,
-                originator_address,
-                originator_port,
-            )
-            .await
-        {
-            Ok(up_chan) => {
-                self.emit_log(
-                    "端口转发通道",
-                    format!("direct-tcpip -> {}:{}", host_to_connect, port_to_connect),
-                    false,
-                );
-                let (upstream_read, upstream_write) = up_chan.split();
-                self.channels
-                    .lock()
-                    .await
-                    .insert(local_id, Arc::new(upstream_write));
-                reply.accept().await;
-                Self::spawn_upstream_to_local_bridge(
-                    upstream_read,
-                    session.handle(),
-                    local_id,
-                    self.channels.clone(),
-                );
-            }
-            Err(_) => {
-                reply.reject(ChannelOpenFailure::ConnectFailed).await;
-            }
-        }
+        // 默认拒绝 AI Agent 发起的 direct-tcpip (`ssh -L` / `-W` / `-D`) 横向端口转发，防止利用跳板扫描远端内网或元数据服务（修复 [HIGH-04]）
+        self.emit_log(
+            "端口转发已拦截",
+            format!(
+                "已根据默认安全隔离策略拒绝 direct-tcpip 请求 -> {}:{} (来源 {}:{})",
+                host_to_connect, port_to_connect, originator_address, originator_port
+            ),
+            true,
+        );
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
         Ok(())
     }
 
@@ -2005,6 +1979,100 @@ mod tests {
         assert!(
             chan2_res.is_err(),
             "当远端主机公钥与已绑定指纹不匹配时，必须拒绝建立会话通道"
+        );
+
+        control.stop();
+    }
+
+    #[tokio::test]
+    async fn test_non_loopback_bind_rejected_and_direct_tcpip_blocked() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut bad_host = RelayHost::new_template(0);
+        bad_host.local_bind_host = "0.0.0.0".to_string();
+        bad_host.local_port = 0;
+        let err_res = start_host_relay(
+            bad_host,
+            LiveCredentials {
+                mode: AgentAuthMode::EphemeralPassword,
+                temp_password: Some("test-pwd".to_string()),
+                dedicated_pubkey: None,
+            },
+            event_tx.clone(),
+        )
+        .await;
+        assert!(
+            err_res.is_err(),
+            "绑定 0.0.0.0 非回环地址必须在启动层被强制拦截"
+        );
+
+        // 启动合法回环监听并验证 direct-tcpip 被 AdministrativelyProhibited 拦截
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
+        let remote_port = remote_listener.local_addr().expect("remote addr").port();
+        let remote_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("remote key");
+        let remote_cfg = Arc::new(server::Config {
+            keys: vec![remote_key],
+            auth_rejection_time: Duration::from_millis(10),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = remote_listener.accept().await {
+                let cfg = remote_cfg.clone();
+                tokio::spawn(async move {
+                    let handler = MockRemoteSshServer {
+                        expected_user: "root".to_string(),
+                        expected_password: "RootPass!2026".to_string(),
+                    };
+                    let _ = server::run_stream(cfg, socket, handler).await;
+                });
+            }
+        });
+
+        let mut host = RelayHost::new_template(1);
+        host.codename = "guard-tcpip-01".to_string();
+        host.local_bind_host = "127.0.0.1".to_string();
+        host.local_port = 0;
+        host.real_host = "127.0.0.1".to_string();
+        host.real_port = remote_port;
+        host.real_user = "root".to_string();
+        host.real_auth = RealAuthConfig::Password {
+            password: "RootPass!2026".to_string(),
+        };
+
+        let temp_pwd = RelayHost::generate_ephemeral_password();
+        let control = start_host_relay(
+            host,
+            LiveCredentials {
+                mode: AgentAuthMode::EphemeralPassword,
+                temp_password: Some(temp_pwd.clone()),
+                dedicated_pubkey: None,
+            },
+            event_tx,
+        )
+        .await
+        .expect("start loopback relay");
+
+        let client_cfg = Arc::new(client::Config::default());
+        let mut sess = client::connect(
+            client_cfg,
+            ("127.0.0.1", control.local_port),
+            UpstreamClientHandler::permissive_for_test(),
+        )
+        .await
+        .expect("connect relay");
+        let auth = sess
+            .authenticate_password("guard-tcpip-01", &temp_pwd)
+            .await
+            .expect("auth");
+        assert!(auth.success());
+
+        let tcpip_res = sess
+            .channel_open_direct_tcpip("169.254.169.254", 80, "127.0.0.1", 55123)
+            .await;
+        assert!(
+            tcpip_res.is_err(),
+            "Agent 发起的 direct-tcpip 端口转发必须被默认拦截"
         );
 
         control.stop();

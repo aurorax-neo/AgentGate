@@ -109,6 +109,8 @@ jobs:
               cp "target/${MAC_TARGET}/release/agent-gate" "${APP_BUNDLE}/Contents/MacOS/agent-gate"
               chmod +x "${APP_BUNDLE}/Contents/MacOS/agent-gate"
               cp "assets/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VER}" "${APP_BUNDLE}/Contents/Info.plist" || true
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VER}" "${APP_BUNDLE}/Contents/Info.plist" || true
               cp "assets/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 
               codesign --force --deep --sign - "${APP_BUNDLE}"
@@ -176,7 +178,7 @@ jobs:
               echo "Priority: optional"
               echo "Architecture: ${DEB_ARCH}"
               echo "Maintainer: AgentGate <noreply@agentgate.io>"
-              echo "Depends: libc6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6"
+              echo "Depends: libc6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6, xdotool"
               echo "Description: Local SSH Isolation Relay Workbench for AI Agents"
               echo " Menu-bar SSH isolation relay workbench built with Rust and GPUI."
             } > "${DEB_ROOT}/DEBIAN/control"
@@ -227,6 +229,11 @@ jobs:
           SRC_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           if [ "$SRC_VER" != "$VER" ]; then
             echo "::error::Cargo.toml version=$SRC_VER 与 Tag=$VER 不一致"
+            exit 1
+          fi
+          PLIST_VER=$(grep -A1 'CFBundleShortVersionString' assets/Info.plist | tail -n1 | sed -E 's/.*<string>(.*)<\/string>.*/\1/')
+          if [ "$PLIST_VER" != "$VER" ]; then
+            echo "::error::assets/Info.plist version=$PLIST_VER 与 Tag=$VER 不一致"
             exit 1
           fi
 

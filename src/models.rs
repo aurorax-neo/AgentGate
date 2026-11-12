@@ -131,14 +131,35 @@ impl RelayHost {
         "127.0.0.1".to_string()
     }
 
+    /// 强制校验并规范化本机监听地址：仅允许回环地址（`127.0.0.0/8`、`::1` 或 `localhost`），
+    /// 拒绝 `0.0.0.0`、`::`、局域网/公网 IP，确保中转端口永不暴露到局域网或公网（修复 [HIGH-02]）
+    pub fn validate_loopback_bind_host(bind_host: &str) -> Result<String, String> {
+        let trimmed = bind_host.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("localhost") {
+            return Ok("127.0.0.1".to_string());
+        }
+        let normalized = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(trimmed);
+        match normalized.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => Ok(ip.to_string()),
+            Ok(ip) => Err(format!(
+                "安全策略拒绝绑定非回环地址 `{}`：本机监听仅允许 127.0.0.1、::1 或 localhost，禁止暴露到局域网或公网",
+                ip
+            )),
+            Err(_) => Err(format!(
+                "本机监听地址 `{}` 格式无效：仅允许填写回环地址（127.0.0.1、::1 或 localhost）",
+                trimmed
+            )),
+        }
+    }
+
     /// 探测并返回一个本机当前未占用的随机端口
     pub fn allocate_free_local_port(bind_host: &str) -> u16 {
-        let host = if bind_host.trim().is_empty() {
-            "127.0.0.1"
-        } else {
-            bind_host.trim()
-        };
-        if let Ok(listener) = std::net::TcpListener::bind((host, 0))
+        let host = Self::validate_loopback_bind_host(bind_host)
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        if let Ok(listener) = std::net::TcpListener::bind((host.as_str(), 0))
             && let Ok(addr) = listener.local_addr()
         {
             return addr.port();
@@ -299,9 +320,11 @@ pub struct RelayRuntimeState {
 impl RelayRuntimeState {
     pub fn rotate_or_clear_temp_password(&mut self, next: Option<String>) {
         if let Some(mut old) = self.current_temp_password.take() {
-            // 覆写旧临时密码内存字节后再释放
+            // 使用 write_volatile 逐字节覆写旧临时密码内存，防止编译器死代码消除 (DSE) 优化（修复 [MED-01]）
             unsafe {
-                old.as_bytes_mut().fill(0);
+                for byte in old.as_bytes_mut().iter_mut() {
+                    std::ptr::write_volatile(byte, 0);
+                }
             }
             std::sync::atomic::compiler_fence(Ordering::SeqCst);
         }
@@ -573,5 +596,36 @@ mod tests {
             assert!(!act.description().is_empty());
             assert!(!act.confirm_button_label().is_empty());
         }
+    }
+
+    #[test]
+    fn test_validate_loopback_bind_host_rejects_non_loopback() {
+        assert_eq!(
+            RelayHost::validate_loopback_bind_host("127.0.0.1").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            RelayHost::validate_loopback_bind_host("127.0.0.2").unwrap(),
+            "127.0.0.2"
+        );
+        assert_eq!(
+            RelayHost::validate_loopback_bind_host("::1").unwrap(),
+            "::1"
+        );
+        assert_eq!(
+            RelayHost::validate_loopback_bind_host("[::1]").unwrap(),
+            "::1"
+        );
+        assert_eq!(
+            RelayHost::validate_loopback_bind_host("localhost").unwrap(),
+            "127.0.0.1"
+        );
+
+        assert!(RelayHost::validate_loopback_bind_host("0.0.0.0").is_err());
+        assert!(RelayHost::validate_loopback_bind_host("::").is_err());
+        assert!(RelayHost::validate_loopback_bind_host("192.168.1.10").is_err());
+        assert!(RelayHost::validate_loopback_bind_host("10.96.1.108").is_err());
+        assert!(RelayHost::validate_loopback_bind_host("8.8.8.8").is_err());
+        assert!(RelayHost::validate_loopback_bind_host("bad host").is_err());
     }
 }

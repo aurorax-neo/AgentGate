@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-12
+
+### 🛡️ Security
+- **主密钥信封加密与系统钥匙串托管**：将本地 `master.key` 升级为 `PBKDF2-HMAC-SHA256`（100,000 次迭代 + 16B 随机盐）结合 `AES-256-GCM` 的信封加密格式（`AGTMK01\0` 头），并在 macOS 默认数据目录下优先托管至系统钥匙串（Keychain `io.agentgate.desktop.vault`），同时自动兼容并无损升级旧版 32 字节密钥文件
+- **强制本地回环绑定校验**：新增 `RelayHost::validate_loopback_bind_host`，在 UI 表单提交、本地配置加载与 `start_host_relay` 启动层强制校验监听地址必须为回环地址（`127.0.0.0/8`、`::1` 或 `localhost`），彻底阻断 `0.0.0.0` 或局域网/公网 IP 绑定
+- **默认阻断 `direct-tcpip` 横向端口转发**：在本地 SSH 服务端默认拦截 AI Agent 发起的 `direct-tcpip`（`ssh -L` / `-W` / `-D`）端口转发请求并记录审计告警，防止利用跳板横向探测远端内网或云元数据服务
+- **代理握手 CRLF 与控制字符注入拦截**：在 `connect_via_proxy` 入口严格校验目标主机名、代理地址及代理账号密码，拒绝任何空白符或控制字符（`\r`、`\n`、`\0` 等）
+- **加密仓库并发互斥与 `0600` 原子写入**：为 `save_hosts` 增加进程级互斥锁与随机 UUID 临时文件，并在 Unix 下通过 `OpenOptionsExt::mode(0o600)` 原子创建 `0600` 权限文件；临时密码轮换/销毁改用 `std::ptr::write_volatile` 防死代码消除擦除
+
+### 🐛 Bug Fixes
+- 移除 GPUI 主线程中同步阻塞的 `global_tokio_runtime().block_on(start_host_relay(...))`，改为异步后台调度与 `oneshot` 回调更新 UI 状态
+- 专用密钥文件名拼入 `host_id` 短标识（`<codename>_<short_uuid>_id_ed25519`），防止在大小写不敏感文件系统上发生密钥覆盖或误删
+- 基于主机条目 `id` 确定性派生本地 SSH 服务端 Ed25519 HostKey，避免重启中转服务后本地指纹频繁变更
+- 加固 Windows 窗口句柄回退查找与 `icacls` 状态日志告警，并在 CI 流程中新增 `Cargo.toml` 与 `assets/Info.plist` 版本一致性校验
+
 ## [0.1.6] - 2026-11-12
 
 ### 🐛 Bug Fixes

@@ -154,9 +154,17 @@ impl AgentGateWorkbench {
 
         let mut modified_keys = false;
         for host in &mut hosts {
-            if host.local_bind_host.trim().is_empty() {
-                host.local_bind_host = RelayHost::default_local_bind_host();
-                modified_keys = true;
+            match RelayHost::validate_loopback_bind_host(&host.local_bind_host) {
+                Ok(normalized) => {
+                    if normalized != host.local_bind_host {
+                        host.local_bind_host = normalized;
+                        modified_keys = true;
+                    }
+                }
+                Err(_) => {
+                    host.local_bind_host = RelayHost::default_local_bind_host();
+                    modified_keys = true;
+                }
             }
             if host.local_port == 0 {
                 host.local_port = std::env::var("AGENTGATE_MIGRATE_PORT")
@@ -173,7 +181,12 @@ impl AgentGateWorkbench {
             let had_key = host.dedicated_key_openssh_pem.is_some();
             let (key_path, pubkey) = storage
                 .ensure_dedicated_agent_key(host, false)
-                .unwrap_or_else(|_| (storage.dedicated_key_path_for(&host.codename), String::new()));
+                .unwrap_or_else(|_| {
+                    (
+                        storage.dedicated_key_path_for(&host.id, &host.codename),
+                        String::new(),
+                    )
+                });
             if !had_key && host.dedicated_key_openssh_pem.is_some() {
                 modified_keys = true;
             }
@@ -471,7 +484,12 @@ impl AgentGateWorkbench {
                 let (key_path, pubkey) = self
                     .storage
                     .ensure_dedicated_agent_key(&mut h, false)
-                    .unwrap_or_else(|_| (self.storage.dedicated_key_path_for(&h.codename), String::new()));
+                    .unwrap_or_else(|_| {
+                        (
+                            self.storage.dedicated_key_path_for(&h.id, &h.codename),
+                            String::new(),
+                        )
+                    });
                 let mut rt = RelayRuntimeState {
                     status: RelayStatus::Stopped,
                     current_temp_password: Some(h.agent_password.clone()),
@@ -828,10 +846,11 @@ impl AgentGateWorkbench {
             return Err(format!("代号 [{}] 已存在，请使用唯一代号以便 AI 区分", codename));
         }
 
-        let local_bind_host = self.form_local_host.read(cx).text().trim().to_string();
-        if local_bind_host.is_empty() {
+        let raw_bind_host = self.form_local_host.read(cx).text().trim().to_string();
+        if raw_bind_host.is_empty() {
             return Err("本机监听地址不能为空（推荐填写 127.0.0.1）".to_string());
         }
+        let local_bind_host = RelayHost::validate_loopback_bind_host(&raw_bind_host)?;
         let local_port: u16 = self
             .form_local_port
             .read(cx)
@@ -980,6 +999,69 @@ impl AgentGateWorkbench {
         }
     }
 
+    /// 异步非阻塞启动单条 SSH 中转监听，避免在 GPUI 主线程调用 `block_on` 造成界面卡顿（修复 [MED-02]）
+    fn spawn_start_relay_async(
+        &mut self,
+        host: RelayHost,
+        live_creds: LiveCredentials,
+        update_banner_on_ok: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let id = host.id;
+        let codename = host.codename.clone();
+        let bind_host = host.local_bind_host.clone();
+        let tx = self.event_tx.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        global_tokio_runtime().spawn(async move {
+            let res = start_host_relay(host, live_creds, tx).await;
+            let _ = done_tx.send(res);
+        });
+
+        cx.spawn(async move |weak_this, cx| {
+            if let Ok(handle_res) = done_rx.await {
+                let _ = weak_this.update(cx, |this, cx| {
+                    match handle_res {
+                        Ok(ctrl) => {
+                            let port = ctrl.local_port;
+                            if let Some(h) = this.hosts.iter_mut().find(|h| h.id == id)
+                                && h.local_port != port
+                            {
+                                h.local_port = port;
+                                let _ = this.storage.save_hosts(&this.hosts);
+                            }
+                            this.controls.insert(id, ctrl);
+                            if let Some(rt) = this.runtimes.get_mut(&id) {
+                                rt.status = RelayStatus::Running {
+                                    local_port: port,
+                                    active_sessions: 0,
+                                };
+                            }
+                            if update_banner_on_ok {
+                                this.status_banner = Some((
+                                    format!(
+                                        "已启动代号 [{}] 本地监听 {}:{}",
+                                        codename, bind_host, port
+                                    ),
+                                    false,
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(rt) = this.runtimes.get_mut(&id) {
+                                rt.status = RelayStatus::Error(err.to_string());
+                            }
+                            this.status_banner =
+                                Some((format!("启动代号 [{}] 失败: {}", codename, err), true));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn request_confirmation(&mut self, action: PendingAction, cx: &mut Context<Self>) {
         self.pending_confirm = Some(action);
         cx.notify();
@@ -1026,39 +1108,8 @@ impl AgentGateWorkbench {
                 rt.current_temp_password = Some(host.agent_password.clone());
                 rt.status = RelayStatus::Starting;
                 let live_creds = Self::build_live_credentials(&host, rt);
-                let tx = self.event_tx.clone();
-                let bind_host = host.local_bind_host.clone();
-                let handle_res = global_tokio_runtime()
-                    .block_on(start_host_relay(host, live_creds, tx));
-                match handle_res {
-                    Ok(ctrl) => {
-                        let port = ctrl.local_port;
-                        if let Some(h) = self.hosts.iter_mut().find(|h| h.id == id)
-                            && h.local_port != port
-                        {
-                            h.local_port = port;
-                            let _ = self.storage.save_hosts(&self.hosts);
-                        }
-                        self.controls.insert(id, ctrl);
-                        if let Some(rt) = self.runtimes.get_mut(&id) {
-                            rt.status = RelayStatus::Running {
-                                local_port: port,
-                                active_sessions: 0,
-                            };
-                        }
-                        self.status_banner = Some((
-                            format!("已启动代号 [{}] 本地监听 {}:{}", codename, bind_host, port),
-                            false,
-                        ));
-                    }
-                    Err(err) => {
-                        if let Some(rt) = self.runtimes.get_mut(&id) {
-                            rt.status = RelayStatus::Error(err.to_string());
-                        }
-                        self.status_banner =
-                            Some((format!("启动代号 [{}] 失败: {}", codename, err), true));
-                    }
-                }
+                self.status_banner = Some((format!("正在启动代号 [{}] 本地监听...", codename), false));
+                self.spawn_start_relay_async(host, live_creds, true, cx);
             }
             PendingAction::StopRelay {
                 id,
@@ -1116,7 +1167,7 @@ impl AgentGateWorkbench {
                 if let Some((prev_name, _, _)) = &prev_snapshot
                     && prev_name != &host.codename
                 {
-                    self.storage.remove_dedicated_key_file(&prev_name);
+                    self.storage.remove_dedicated_key_file(&host.id, prev_name);
                 }
 
                 let id = host.id;
@@ -1168,19 +1219,8 @@ impl AgentGateWorkbench {
                         old_ctrl.stop();
                     }
                     let live_creds = Self::build_live_credentials(&host, rt);
-                    let tx = self.event_tx.clone();
-                    if let Ok(new_ctrl) = global_tokio_runtime()
-                        .block_on(start_host_relay((*host).clone(), live_creds, tx))
-                    {
-                        let p = new_ctrl.local_port;
-                        self.controls.insert(id, new_ctrl);
-                        if let Some(rt) = self.runtimes.get_mut(&id) {
-                            rt.status = RelayStatus::Running {
-                                local_port: p,
-                                active_sessions: 0,
-                            };
-                        }
-                    }
+                    rt.status = RelayStatus::Starting;
+                    self.spawn_start_relay_async((*host).clone(), live_creds, false, cx);
                 } else if let Some(ctrl) = self.controls.get(&id) {
                     let creds = Self::build_live_credentials(&host, rt);
                     ctrl.update_host((*host).clone());
@@ -1200,7 +1240,7 @@ impl AgentGateWorkbench {
                 if let Some(ctrl) = self.controls.remove(&id) {
                     ctrl.stop();
                 }
-                self.storage.remove_dedicated_key_file(&codename);
+                self.storage.remove_dedicated_key_file(&id, &codename);
                 self.hosts.retain(|h| h.id != id);
                 self.runtimes.remove(&id);
                 let _ = self.storage.save_hosts(&self.hosts);

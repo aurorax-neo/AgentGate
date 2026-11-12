@@ -1,17 +1,28 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use rand::RngExt;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::pbkdf2::{PBKDF2_HMAC_SHA256, derive};
 use russh::keys::ssh_key::{Algorithm, LineEnding, PrivateKey};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::models::RelayHost;
 
 const VAULT_MAGIC: &[u8; 8] = b"AGTVLT01";
+const MASTER_KEY_SEAL_MAGIC: &[u8; 8] = b"AGTMK01\0";
+const KEK_SALT_LEN: usize = 16;
+const KEK_ITERATIONS: u32 = 100_000;
 const NONCE_LEN: usize = 12;
 const MASTER_KEY_LEN: usize = 32;
+
+/// 进程内全局仓库写入互斥锁，防止多线程并发写入或覆盖临时文件（修复 [HIGH-05]）
+static VAULT_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[inline]
 fn zeroize_slice(buf: &mut [u8]) {
@@ -33,6 +44,8 @@ pub struct VaultPayload {
 #[derive(Debug, Clone)]
 pub struct EncryptedStorage {
     base_dir: PathBuf,
+    use_os_keychain: bool,
+    cached_master_key: Arc<Mutex<Option<[u8; MASTER_KEY_LEN]>>>,
 }
 
 impl EncryptedStorage {
@@ -46,7 +59,9 @@ impl EncryptedStorage {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AgentGate");
-        Self::new_in_dir(base)
+        let mut storage = Self::new_in_dir(base)?;
+        storage.use_os_keychain = true;
+        Ok(storage)
     }
 
     pub fn new_in_dir(base_dir: impl Into<PathBuf>) -> Result<Self> {
@@ -58,7 +73,11 @@ impl EncryptedStorage {
             .with_context(|| format!("创建专用密钥目录失败: {}", keys_dir.display()))?;
         set_dir_permissions_0700(&base_dir)?;
         set_dir_permissions_0700(&keys_dir)?;
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            use_os_keychain: false,
+            cached_master_key: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -77,36 +96,157 @@ impl EncryptedStorage {
         self.base_dir.join("agent_keys")
     }
 
-    /// 加载或初始化 256-bit 本机主密钥（权限 0600）
+    /// 派生与本机环境及仓库路径绑定的信封密钥加密密钥 (KEK)
+    fn derive_envelope_kek(&self, salt: &[u8; KEK_SALT_LEN]) -> [u8; MASTER_KEY_LEN] {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "agentgate-local-user".to_string());
+        let canonical = self
+            .base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.base_dir.clone());
+        let mut material = Vec::with_capacity(128);
+        material.extend_from_slice(b"AgentGate::MasterKeyEnvelope::v1::");
+        material.extend_from_slice(user.as_bytes());
+        material.push(b':');
+        material.extend_from_slice(canonical.to_string_lossy().as_bytes());
+
+        let mut kek = [0u8; MASTER_KEY_LEN];
+        derive(
+            PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(KEK_ITERATIONS).expect("non-zero iterations"),
+            salt,
+            &material,
+            &mut kek,
+        );
+        zeroize_slice(&mut material);
+        kek
+    }
+
+    /// 使用 PBKDF2-HMAC-SHA256 + AES-256-GCM 封装 32 字节主密钥，杜绝裸明文 `master.key` 落盘（修复 [HIGH-01]）
+    fn seal_master_key_envelope(&self, master_key: &[u8; MASTER_KEY_LEN]) -> Result<Vec<u8>> {
+        let mut salt = [0u8; KEK_SALT_LEN];
+        rand::rng().fill(&mut salt);
+        let mut kek_bytes = self.derive_envelope_kek(&salt);
+        let unbound_res = UnboundKey::new(&AES_256_GCM, &kek_bytes);
+        zeroize_slice(&mut kek_bytes);
+        let unbound = unbound_res.map_err(|_| anyhow!("初始化主密钥信封 KEK 失败"))?;
+        let kek = LessSafeKey::new(unbound);
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rng().fill(&mut nonce_bytes);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut in_out = master_key.to_vec();
+        kek.seal_in_place_append_tag(nonce, Aad::from(MASTER_KEY_SEAL_MAGIC), &mut in_out)
+            .map_err(|_| anyhow!("封装主密钥信封失败"))?;
+
+        let mut out =
+            Vec::with_capacity(MASTER_KEY_SEAL_MAGIC.len() + KEK_SALT_LEN + NONCE_LEN + in_out.len());
+        out.extend_from_slice(MASTER_KEY_SEAL_MAGIC);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&in_out);
+        zeroize_slice(&mut in_out);
+        Ok(out)
+    }
+
+    /// 解封 `AGTMK01\0` 信封格式的主密钥文件
+    fn open_master_key_envelope(&self, raw: &[u8]) -> Result<[u8; MASTER_KEY_LEN]> {
+        let header_len = MASTER_KEY_SEAL_MAGIC.len() + KEK_SALT_LEN + NONCE_LEN;
+        if raw.len() != header_len + MASTER_KEY_LEN + AES_256_GCM.tag_len() {
+            return Err(anyhow!("加密主密钥信封长度无效"));
+        }
+        let mut salt = [0u8; KEK_SALT_LEN];
+        salt.copy_from_slice(&raw[MASTER_KEY_SEAL_MAGIC.len()..MASTER_KEY_SEAL_MAGIC.len() + KEK_SALT_LEN]);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes.copy_from_slice(&raw[MASTER_KEY_SEAL_MAGIC.len() + KEK_SALT_LEN..header_len]);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut kek_bytes = self.derive_envelope_kek(&salt);
+        let unbound_res = UnboundKey::new(&AES_256_GCM, &kek_bytes);
+        zeroize_slice(&mut kek_bytes);
+        let unbound = unbound_res.map_err(|_| anyhow!("初始化主密钥解封 KEK 失败"))?;
+        let kek = LessSafeKey::new(unbound);
+
+        let mut ciphertext = raw[header_len..].to_vec();
+        let plain = kek
+            .open_in_place(nonce, Aad::from(MASTER_KEY_SEAL_MAGIC), &mut ciphertext)
+            .map_err(|_| anyhow!("解封本机主密钥失败：密钥文件已损坏或不属于当前环境"))?;
+        let mut key = [0u8; MASTER_KEY_LEN];
+        key.copy_from_slice(&plain[..MASTER_KEY_LEN]);
+        zeroize_slice(&mut ciphertext);
+        Ok(key)
+    }
+
+    /// 加载或初始化 256-bit 本机主密钥（支持系统钥匙串优先托管、PBKDF2+AES-GCM 信封落盘及旧版明文密钥无损自动升级）
     fn load_or_create_master_key(&self) -> Result<[u8; MASTER_KEY_LEN]> {
+        if let Ok(guard) = self.cached_master_key.lock()
+            && let Some(cached) = *guard
+        {
+            return Ok(cached);
+        }
+
+        if self.use_os_keychain
+            && let Some(kc_key) = try_load_os_keychain_master_key()
+        {
+            if let Ok(mut guard) = self.cached_master_key.lock() {
+                *guard = Some(kc_key);
+            }
+            return Ok(kc_key);
+        }
+
         let key_path = self.master_key_path();
         if key_path.exists() {
             let mut bytes = fs::read(&key_path)
                 .with_context(|| format!("读取本机主密钥失败: {}", key_path.display()))?;
-            if bytes.len() != MASTER_KEY_LEN {
-                zeroize_slice(&mut bytes);
-                return Err(anyhow!(
-                    "主密钥长度异常（期望 {} 字节，实际 {} 字节）",
-                    MASTER_KEY_LEN,
+            let key_res = if bytes.starts_with(MASTER_KEY_SEAL_MAGIC) {
+                self.open_master_key_envelope(&bytes)
+            } else if bytes.len() == MASTER_KEY_LEN {
+                // 兼容旧版 32 字节裸主密钥并立即升级为加密信封格式
+                let mut legacy_key = [0u8; MASTER_KEY_LEN];
+                legacy_key.copy_from_slice(&bytes);
+                if let Ok(sealed) = self.seal_master_key_envelope(&legacy_key) {
+                    let _ = write_secret_file_0600(&key_path, &sealed);
+                }
+                Ok(legacy_key)
+            } else {
+                Err(anyhow!(
+                    "主密钥格式或长度异常（实际 {} 字节）",
                     bytes.len()
-                ));
-            }
-            let mut key = [0u8; MASTER_KEY_LEN];
-            key.copy_from_slice(&bytes);
+                ))
+            };
             zeroize_slice(&mut bytes);
+            let key = key_res?;
+            if self.use_os_keychain {
+                let _ = try_store_os_keychain_master_key(&key);
+            }
+            if let Ok(mut guard) = self.cached_master_key.lock() {
+                *guard = Some(key);
+            }
             return Ok(key);
         }
 
         let mut key = [0u8; MASTER_KEY_LEN];
         rand::rng().fill(&mut key);
-        fs::write(&key_path, key)
-            .with_context(|| format!("写入本机主密钥失败: {}", key_path.display()))?;
-        set_file_permissions_0600(&key_path)?;
+        let sealed = self.seal_master_key_envelope(&key)?;
+        write_secret_file_0600(&key_path, &sealed)
+            .with_context(|| format!("写入本机加密主密钥失败: {}", key_path.display()))?;
+        if self.use_os_keychain {
+            let _ = try_store_os_keychain_master_key(&key);
+        }
+        if let Ok(mut guard) = self.cached_master_key.lock() {
+            *guard = Some(key);
+        }
         Ok(key)
     }
 
-    /// 使用 AES-256-GCM 加密保存全部主机配置到 vault.enc
+    /// 使用 AES-256-GCM 加密保存全部主机配置到 vault.enc（带进程级并发互斥锁与随机临时文件原子替换）
     pub fn save_hosts(&self, hosts: &[RelayHost]) -> Result<()> {
+        let _guard = VAULT_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let mut key_bytes = self.load_or_create_master_key()?;
         let unbound_res = UnboundKey::new(&AES_256_GCM, &key_bytes);
         zeroize_slice(&mut key_bytes);
@@ -124,19 +264,27 @@ impl EncryptedStorage {
         rand::rng().fill(&mut nonce_bytes);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        key.seal_in_place_append_tag(nonce, Aad::from(VAULT_MAGIC), &mut in_out)
-            .map_err(|_| anyhow!("AES-256-GCM 加密失败"))?;
+        let seal_res = key.seal_in_place_append_tag(nonce, Aad::from(VAULT_MAGIC), &mut in_out);
+        if seal_res.is_err() {
+            zeroize_slice(&mut in_out);
+            return Err(anyhow!("AES-256-GCM 加密失败"));
+        }
 
         let mut file_bytes = Vec::with_capacity(VAULT_MAGIC.len() + NONCE_LEN + in_out.len());
         file_bytes.extend_from_slice(VAULT_MAGIC);
         file_bytes.extend_from_slice(&nonce_bytes);
         file_bytes.extend_from_slice(&in_out);
+        zeroize_slice(&mut in_out);
 
-        let tmp_path = self.base_dir.join("vault.enc.tmp");
-        fs::write(&tmp_path, &file_bytes)
+        let tmp_path = self
+            .base_dir
+            .join(format!("vault.enc.tmp.{}", Uuid::new_v4().simple()));
+        write_secret_file_0600(&tmp_path, &file_bytes)
             .with_context(|| format!("写入加密临时文件失败: {}", tmp_path.display()))?;
-        set_file_permissions_0600(&tmp_path)?;
-        fs::rename(&tmp_path, self.vault_file_path()).context("替换加密配置文件失败")?;
+        if let Err(err) = fs::rename(&tmp_path, self.vault_file_path()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err).context("替换加密配置文件失败");
+        }
         Ok(())
     }
 
@@ -209,11 +357,10 @@ impl EncryptedStorage {
             })?
         };
 
-        let key_path = self.dedicated_key_path_for(&host.codename);
+        let key_path = self.dedicated_key_path_for(&host.id, &host.codename);
         if let Some(pem) = &host.dedicated_key_openssh_pem {
-            fs::write(&key_path, pem.as_bytes())
+            write_secret_file_0600(&key_path, pem.as_bytes())
                 .with_context(|| format!("写入本地专用密钥文件失败: {}", key_path.display()))?;
-            set_file_permissions_0600(&key_path)?;
         }
 
         let pubkey_openssh = private_key
@@ -223,7 +370,8 @@ impl EncryptedStorage {
         Ok((key_path, pubkey_openssh))
     }
 
-    pub fn dedicated_key_path_for(&self, codename: &str) -> PathBuf {
+    /// 生成带 `host_id` 短标识的专用密钥路径，防止大小写不敏感文件系统上 `node-A` 与 `node-a` 互相覆盖或误删（修复 [MED-03]）
+    pub fn dedicated_key_path_for(&self, host_id: &Uuid, codename: &str) -> PathBuf {
         let safe_name: String = codename
             .chars()
             .map(|c| {
@@ -234,16 +382,115 @@ impl EncryptedStorage {
                 }
             })
             .collect();
+        let id_simple = host_id.simple().to_string();
+        let short_id = &id_simple[..8];
         self.agent_keys_dir()
-            .join(format!("{}_id_ed25519", safe_name))
+            .join(format!("{}_{}_id_ed25519", safe_name, short_id))
     }
 
-    pub fn remove_dedicated_key_file(&self, codename: &str) {
-        let path = self.dedicated_key_path_for(codename);
+    pub fn remove_dedicated_key_file(&self, host_id: &Uuid, codename: &str) {
+        let path = self.dedicated_key_path_for(host_id, codename);
         if path.exists() {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// 原子创建并写入 `0600` 权限敏感文件，杜绝先以默认 umask 落盘再 chmod 的权限时间窗（修复 [HIGH-05]）
+fn write_secret_file_0600(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".tmp.{}.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("secret"),
+        Uuid::new_v4().simple()
+    ));
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("创建 0600 临时敏感文件失败: {}", tmp_path.display()))?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| format!("创建临时敏感文件失败: {}", tmp_path.display()))?;
+
+    if let Err(err) = file.write_all(content).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("写入临时敏感文件失败: {}", tmp_path.display()));
+    }
+    drop(file);
+    set_file_permissions_0600(&tmp_path)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("替换敏感文件失败: {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn try_load_os_keychain_master_key() -> Option<[u8; MASTER_KEY_LEN]> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "io.agentgate.desktop.vault",
+            "-a",
+            "master-key-v1",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let encoded = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+    if decoded.len() != MASTER_KEY_LEN {
+        zeroize_slice(&mut decoded);
+        return None;
+    }
+    let mut key = [0u8; MASTER_KEY_LEN];
+    key.copy_from_slice(&decoded);
+    zeroize_slice(&mut decoded);
+    Some(key)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_load_os_keychain_master_key() -> Option<[u8; MASTER_KEY_LEN]> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn try_store_os_keychain_master_key(key: &[u8; MASTER_KEY_LEN]) -> bool {
+    let encoded = data_encoding::BASE64.encode(key);
+    std::process::Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            "io.agentgate.desktop.vault",
+            "-a",
+            "master-key-v1",
+            "-w",
+            &encoded,
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_store_os_keychain_master_key(_key: &[u8; MASTER_KEY_LEN]) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -270,11 +517,24 @@ fn set_file_permissions_0600(_path: &Path) -> Result<()> {
             })
             .unwrap_or_else(|| "*S-1-5-32-544".to_string());
         let grant_arg = format!("{}:(F)", principal);
-        let _ = std::process::Command::new("icacls")
+        match std::process::Command::new("icacls")
             .arg(_path)
             .args(["/inheritance:r", "/grant:r", &grant_arg])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .output()
+        {
+            Ok(out) if !out.status.success() => {
+                log::warn!(
+                    "Windows icacls 设置文件 ACL 权限返回非零状态 ({}): {}",
+                    out.status,
+                    _path.display()
+                );
+            }
+            Err(e) => {
+                log::warn!("调用 Windows icacls 设置文件权限失败 ({}): {}", _path.display(), e);
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -303,11 +563,24 @@ fn set_dir_permissions_0700(_path: &Path) -> Result<()> {
             })
             .unwrap_or_else(|| "*S-1-5-32-544".to_string());
         let grant_arg = format!("{}:(OI)(CI)(F)", principal);
-        let _ = std::process::Command::new("icacls")
+        match std::process::Command::new("icacls")
             .arg(_path)
             .args(["/inheritance:r", "/grant:r", &grant_arg])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .output()
+        {
+            Ok(out) if !out.status.success() => {
+                log::warn!(
+                    "Windows icacls 设置目录 ACL 权限返回非零状态 ({}): {}",
+                    out.status,
+                    _path.display()
+                );
+            }
+            Err(e) => {
+                log::warn!("调用 Windows icacls 设置目录权限失败 ({}): {}", _path.display(), e);
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -405,7 +678,83 @@ mod tests {
         assert_ne!(pub1, pub3);
 
         // 删除主机时同步清理专用密钥文件
-        storage.remove_dedicated_key_file(&host.codename);
+        storage.remove_dedicated_key_file(&host.id, &host.codename);
         assert!(!path1.exists());
+    }
+
+    #[test]
+    fn test_master_key_envelope_encryption_and_legacy_migration() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let storage = EncryptedStorage::new_in_dir(dir.path()).expect("init storage");
+
+        let host = RelayHost::new_template(0);
+        storage
+            .save_hosts(std::slice::from_ref(&host))
+            .expect("save hosts");
+
+        // 验证落盘的 master.key 采用 AGTMK01\0 信封加密而非裸 32 字节
+        let mk_bytes = fs::read(storage.master_key_path()).expect("read master.key");
+        assert!(mk_bytes.starts_with(MASTER_KEY_SEAL_MAGIC));
+        assert_ne!(mk_bytes.len(), MASTER_KEY_LEN);
+
+        // 模拟旧版 32 字节裸 master.key 升级迁移
+        let dir2 = tempfile::tempdir().expect("create tempdir 2");
+        let legacy_raw_key = [0x42u8; MASTER_KEY_LEN];
+        fs::write(dir2.path().join("master.key"), legacy_raw_key).expect("write legacy key");
+        let storage2 = EncryptedStorage::new_in_dir(dir2.path()).expect("init storage2");
+        storage2
+            .save_hosts(std::slice::from_ref(&host))
+            .expect("save with migrated key");
+        let upgraded_bytes = fs::read(storage2.master_key_path()).expect("read upgraded key");
+        assert!(
+            upgraded_bytes.starts_with(MASTER_KEY_SEAL_MAGIC),
+            "legacy raw 32-byte master.key should be automatically upgraded to sealed envelope"
+        );
+        let loaded = storage2.load_hosts().expect("load after migration");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, host.id);
+    }
+
+    #[test]
+    fn test_concurrent_save_hosts_and_case_collision_key_isolation() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let storage = EncryptedStorage::new_in_dir(dir.path()).expect("init storage");
+
+        // 1. 验证大小写仅存差异的两个代号拥有独立密钥路径，互不覆盖或误删
+        let mut host_upper = RelayHost::new_template(0);
+        host_upper.codename = "Node-Collision".to_string();
+        let mut host_lower = RelayHost::new_template(1);
+        host_lower.codename = "node-collision".to_string();
+
+        let (path_upper, pub_upper) = storage
+            .ensure_dedicated_agent_key(&mut host_upper, false)
+            .expect("key upper");
+        let (path_lower, pub_lower) = storage
+            .ensure_dedicated_agent_key(&mut host_lower, false)
+            .expect("key lower");
+        assert_ne!(path_upper, path_lower);
+        assert_ne!(pub_upper, pub_lower);
+        storage.remove_dedicated_key_file(&host_upper.id, &host_upper.codename);
+        assert!(!path_upper.exists());
+        assert!(
+            path_lower.exists(),
+            "removing upper-case host key must not delete lower-case host key on case-insensitive FS"
+        );
+
+        // 2. 验证多线程并发调用 save_hosts 时不会发生临时文件冲突或损坏仓库
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let st = storage.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut h = RelayHost::new_template(i);
+                h.codename = format!("concurrent-node-{:02}", i);
+                st.save_hosts(&[h]).expect("concurrent save_hosts");
+            }));
+        }
+        for h in handles {
+            h.join().expect("join thread");
+        }
+        let final_hosts = storage.load_hosts().expect("load after concurrent writes");
+        assert_eq!(final_hosts.len(), 1);
     }
 }

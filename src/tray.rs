@@ -970,35 +970,38 @@ mod windows_tray {
         let current_pid = std::process::id();
         let class_name: Vec<u16> = "Zed::Window\0".encode_utf16().collect();
         let win_name: Vec<u16> = "AgentGate\0".encode_utf16().collect();
-        let mut cursor = HWND::default();
-        while let Ok(found) = unsafe {
-            FindWindowExW(
-                None,
-                Some(cursor),
-                PCWSTR(class_name.as_ptr()),
-                PCWSTR(win_name.as_ptr()),
-            )
-        } {
-            if found.0.is_null() {
-                break;
-            }
-            cursor = found;
-            let mut win_pid = 0u32;
-            unsafe {
-                GetWindowThreadProcessId(found, Some(&mut win_pid));
-            }
-            if win_pid == current_pid {
-                let raw = found.0 as isize;
-                MAIN_HWND.store(raw, Ordering::SeqCst);
-                // 使用同线程隐藏 Owner 窗口移除任务栏图标，避免 WS_EX_TOOLWINDOW 导致最大化遮挡任务栏
-                let ex = unsafe { GetWindowLongPtrW(found, GWL_EXSTYLE) };
-                let new_ex = ex & !(WS_EX_APPWINDOW.0 as isize) & !(WS_EX_TOOLWINDOW.0 as isize);
-                let _ = unsafe { SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex) };
-                let owner_raw = HIDDEN_OWNER_HWND.load(Ordering::SeqCst);
-                if owner_raw != 0 {
-                    let _ = unsafe { SetWindowLongPtrW(found, GWLP_HWNDPARENT, owner_raw) };
+        for class_ptr in [PCWSTR(class_name.as_ptr()), PCWSTR::null()] {
+            let mut cursor = HWND::default();
+            while let Ok(found) = unsafe {
+                FindWindowExW(
+                    None,
+                    Some(cursor),
+                    class_ptr,
+                    PCWSTR(win_name.as_ptr()),
+                )
+            } {
+                if found.0.is_null() {
+                    break;
                 }
-                return Some(found);
+                cursor = found;
+                let mut win_pid = 0u32;
+                unsafe {
+                    GetWindowThreadProcessId(found, Some(&mut win_pid));
+                }
+                if win_pid == current_pid {
+                    let raw = found.0 as isize;
+                    MAIN_HWND.store(raw, Ordering::SeqCst);
+                    // 使用同线程隐藏 Owner 窗口移除任务栏图标，避免 WS_EX_TOOLWINDOW 导致最大化遮挡任务栏
+                    let ex = unsafe { GetWindowLongPtrW(found, GWL_EXSTYLE) };
+                    let new_ex =
+                        ex & !(WS_EX_APPWINDOW.0 as isize) & !(WS_EX_TOOLWINDOW.0 as isize);
+                    let _ = unsafe { SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex) };
+                    let owner_raw = HIDDEN_OWNER_HWND.load(Ordering::SeqCst);
+                    if owner_raw != 0 {
+                        let _ = unsafe { SetWindowLongPtrW(found, GWLP_HWNDPARENT, owner_raw) };
+                    }
+                    return Some(found);
+                }
             }
         }
         None
@@ -1284,9 +1287,15 @@ mod linux_tray {
     pub fn set_visible(visible: bool) {
         let pid = std::process::id().to_string();
         let action = if visible { "windowmap" } else { "windowunmap" };
-        let _ = std::process::Command::new("xdotool")
+        if let Err(err) = std::process::Command::new("xdotool")
             .args(["search", "--pid", &pid, action, "%@"])
-            .status();
+            .status()
+        {
+            log::debug!(
+                "Linux xdotool 窗口切换未生效（Wayland 会话由 GPUI 内部窗口激活接管）: {}",
+                err
+            );
+        }
     }
 }
 

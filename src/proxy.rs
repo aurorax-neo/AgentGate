@@ -11,6 +11,50 @@ use crate::models::ProxyConfig;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// 校验目标主机名与代理凭据，阻断 CRLF 头部注入与控制字符（修复 [HIGH-03]）
+fn validate_proxy_and_target_inputs(
+    target_host: &str,
+    proxy_host: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    let th = target_host.trim();
+    if th.is_empty()
+        || th != target_host
+        || th.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(anyhow!(
+            "[阶段: 参数安全校验] 目标主机名包含非法空白或控制字符，已拒绝发起连接"
+        ));
+    }
+    if let Some(ph) = proxy_host {
+        let ph_trim = ph.trim();
+        if ph_trim.is_empty()
+            || ph_trim != ph
+            || ph_trim.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(anyhow!(
+                "[阶段: 参数安全校验] 代理服务器地址包含非法空白或控制字符"
+            ));
+        }
+    }
+    if let Some(u) = username
+        && u.chars().any(|c| c.is_control())
+    {
+        return Err(anyhow!(
+            "[阶段: 参数安全校验] 代理认证用户名包含非法控制字符"
+        ));
+    }
+    if let Some(p) = password
+        && p.chars().any(|c| c.is_control())
+    {
+        return Err(anyhow!(
+            "[阶段: 参数安全校验] 代理认证密码包含非法控制字符"
+        ));
+    }
+    Ok(())
+}
+
 /// 根据条目的代理配置建立到目标远端主机的底层 TCP 隧道
 /// 注意：所有返回的错误信息均经过脱敏，不泄露真实远端 IP 给 Agent
 pub async fn connect_via_proxy(
@@ -19,13 +63,22 @@ pub async fn connect_via_proxy(
     target_port: u16,
 ) -> Result<TcpStream> {
     let stream = match proxy {
-        ProxyConfig::None => connect_direct(target_host, target_port).await?,
+        ProxyConfig::None => {
+            validate_proxy_and_target_inputs(target_host, None, None, None)?;
+            connect_direct(target_host, target_port).await?
+        }
         ProxyConfig::Socks5 {
             host,
             port,
             username,
             password,
         } => {
+            validate_proxy_and_target_inputs(
+                target_host,
+                Some(host),
+                username.as_deref(),
+                password.as_deref(),
+            )?;
             connect_socks5(
                 host,
                 *port,
@@ -42,6 +95,12 @@ pub async fn connect_via_proxy(
             username,
             password,
         } => {
+            validate_proxy_and_target_inputs(
+                target_host,
+                Some(host),
+                username.as_deref(),
+                password.as_deref(),
+            )?;
             connect_http_tunnel(
                 host,
                 *port,
@@ -388,5 +447,35 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_crlf_and_control_char_injection_rejected() {
+        let bad_target = "10.0.0.1:22 HTTP/1.1\r\nX-Injected: pwned";
+        let res_http = connect_via_proxy(
+            &ProxyConfig::HttpConnect {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                username: None,
+                password: None,
+            },
+            bad_target,
+            22,
+        )
+        .await;
+        assert!(res_http.is_err());
+
+        let res_cred = connect_via_proxy(
+            &ProxyConfig::HttpConnect {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                username: Some("admin\r\nInjected: 1".to_string()),
+                password: Some("pass".to_string()),
+            },
+            "10.0.0.1",
+            22,
+        )
+        .await;
+        assert!(res_cred.is_err());
     }
 }
