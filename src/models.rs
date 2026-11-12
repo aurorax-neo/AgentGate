@@ -81,7 +81,7 @@ pub enum AgentAuthMode {
 impl AgentAuthMode {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::EphemeralPassword => "临时随机密码",
+            Self::EphemeralPassword => "本地固定密码",
             Self::DedicatedKey => "专用本地密钥 (Ed25519)",
         }
     }

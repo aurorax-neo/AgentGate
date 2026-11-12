@@ -141,13 +141,7 @@ pub async fn start_host_relay(
 
     let mut server_cfg = server::Config {
         server_id: SshId::Standard(Cow::Borrowed("SSH-2.0-AgentGate_LocalRelay")),
-        methods: MethodSet::from(
-            &[
-                MethodKind::Password,
-                MethodKind::PublicKey,
-                MethodKind::KeyboardInteractive,
-            ][..],
-        ),
+        methods: MethodSet::from(&[MethodKind::Password, MethodKind::PublicKey][..]),
         auth_rejection_time: Duration::from_millis(80),
         auth_rejection_time_initial: Some(Duration::from_millis(0)),
         keys: vec![host_key],
@@ -287,14 +281,261 @@ struct UpstreamClientHandler {
     event_tx: Option<mpsc::UnboundedSender<RelayEvent>>,
 }
 
-impl UpstreamClientHandler {
-    fn new(live_host: Arc<RwLock<RelayHost>>, event_tx: mpsc::UnboundedSender<RelayEvent>) -> Self {
-        Self {
-            live_host: Some(live_host),
-            event_tx: Some(event_tx),
-        }
-    }
+/// 建立并认证到真实远端上游 SSH 主机的连接（供实时中转与「上游测试」功能共同复用）
+async fn connect_and_authenticate_upstream(
+    host: &RelayHost,
+    live_host_ref: Arc<RwLock<RelayHost>>,
+    event_tx: Option<mpsc::UnboundedSender<RelayEvent>>,
+) -> Result<(client::Handle<UpstreamClientHandler>, u128)> {
+    let started = Instant::now();
+    let connect_fut = async {
+        let tcp_stream = connect_via_proxy(&host.proxy, &host.real_host, host.real_port).await?;
 
+        let preferred = Preferred {
+            kex: Cow::Borrowed(&[
+                russh::kex::MLKEM768X25519_SHA256,
+                russh::kex::CURVE25519,
+                russh::kex::CURVE25519_PRE_RFC_8731,
+                russh::kex::ECDH_SHA2_NISTP256,
+                russh::kex::ECDH_SHA2_NISTP384,
+                russh::kex::ECDH_SHA2_NISTP521,
+                russh::kex::DH_GEX_SHA256,
+                russh::kex::DH_G18_SHA512,
+                russh::kex::DH_G17_SHA512,
+                russh::kex::DH_G16_SHA512,
+                russh::kex::DH_G15_SHA512,
+                russh::kex::DH_G14_SHA256,
+                russh::kex::DH_GEX_SHA1,
+                russh::kex::DH_G14_SHA1,
+                russh::kex::DH_G1_SHA1,
+                russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+            ]),
+            key: Cow::Borrowed(&[
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP521,
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256),
+                },
+                Algorithm::Rsa { hash: None },
+            ]),
+            cipher: Cow::Borrowed(&[
+                russh::cipher::CHACHA20_POLY1305,
+                russh::cipher::AES_256_GCM,
+                russh::cipher::AES_128_GCM,
+                russh::cipher::AES_256_CTR,
+                russh::cipher::AES_192_CTR,
+                russh::cipher::AES_128_CTR,
+                russh::cipher::AES_256_CBC,
+                russh::cipher::AES_192_CBC,
+                russh::cipher::AES_128_CBC,
+            ]),
+            mac: Cow::Borrowed(&[
+                russh::mac::HMAC_SHA512_ETM,
+                russh::mac::HMAC_SHA256_ETM,
+                russh::mac::HMAC_SHA512,
+                russh::mac::HMAC_SHA256,
+                russh::mac::HMAC_SHA1_ETM,
+                russh::mac::HMAC_SHA1,
+            ]),
+            ..Preferred::DEFAULT
+        };
+
+        let client_cfg = Arc::new(client::Config {
+            inactivity_timeout: Some(Duration::from_secs(1800)),
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_max: 6,
+            nodelay: true,
+            preferred,
+            ..Default::default()
+        });
+
+        let mut handle = client::connect_stream(
+            client_cfg,
+            tcp_stream,
+            UpstreamClientHandler {
+                live_host: Some(live_host_ref),
+                event_tx,
+            },
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "[阶段: SSH协议握手] 协商失败 (代理: {}, 端口: :{}, 耗时: {}ms, 原因: {})",
+                host.proxy.badge_text(),
+                host.real_port,
+                started.elapsed().as_millis(),
+                sanitize_error(&e.to_string(), host)
+            )
+        })?;
+
+        let (auth_ok, auth_diag) = match &host.real_auth {
+            RealAuthConfig::Password { password } => {
+                let pwd_clean = password.trim_matches(['\r', '\n']);
+                let pwd_res = handle
+                    .authenticate_password(&host.real_user, pwd_clean.to_string())
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "[阶段: SSH密码认证] 请求异常 (耗时: {}ms, 原因: {})",
+                            started.elapsed().as_millis(),
+                            sanitize_error(&e.to_string(), host)
+                        )
+                    })?;
+                if pwd_res.success() {
+                    (true, String::new())
+                } else {
+                    let remaining_str = format!("{:?}", pwd_res);
+                    // 自动回退尝试 PAM keyboard-interactive 认证
+                    let mut kbd_ok = false;
+                    if let Ok(mut resp) = handle
+                        .authenticate_keyboard_interactive_start(&host.real_user, None)
+                        .await
+                    {
+                        for _ in 0..4 {
+                            match resp {
+                                client::KeyboardInteractiveAuthResponse::Success => {
+                                    kbd_ok = true;
+                                    break;
+                                }
+                                client::KeyboardInteractiveAuthResponse::Failure { .. } => {
+                                    break;
+                                }
+                                client::KeyboardInteractiveAuthResponse::InfoRequest {
+                                    prompts,
+                                    ..
+                                } => {
+                                    let answers = if prompts.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![pwd_clean.to_string(); prompts.len()]
+                                    };
+                                    match handle
+                                        .authenticate_keyboard_interactive_respond(answers)
+                                        .await
+                                    {
+                                        Ok(next) => resp = next,
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let root_hint = if host.real_user == "root"
+                        && remaining_str.contains("PublicKey")
+                        && remaining_str.contains("Password")
+                    {
+                        " [排查建议: 确认 root 密码无误，或检查远端 /etc/ssh/sshd_config 是否已设置 PermitRootLogin yes（Debian/Ubuntu 默认 prohibit-password 会拒绝 root 密码登录）]"
+                    } else {
+                        ""
+                    };
+                    (
+                        kbd_ok,
+                        format!(
+                            "password 与 keyboard-interactive 均被拒绝 (密码长度: {} 字符, 服务端返回: {}){}",
+                            pwd_clean.chars().count(),
+                            sanitize_error(&remaining_str, host),
+                            root_hint
+                        ),
+                    )
+                }
+            }
+            RealAuthConfig::PrivateKey {
+                private_key_pem,
+                passphrase,
+            } => {
+                let decoded_key = decode_secret_key(
+                    private_key_pem,
+                    passphrase.as_deref().filter(|p| !p.is_empty()),
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "[阶段: 本地私钥解析] 解析真实远端私钥失败 ({})",
+                        sanitize_error(&e.to_string(), host)
+                    )
+                })?;
+                let rsa_hash = if decoded_key.algorithm().is_rsa() {
+                    handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .ok()
+                        .flatten()
+                        .flatten()
+                } else {
+                    None
+                };
+                let key_res = handle
+                    .authenticate_publickey(
+                        &host.real_user,
+                        PrivateKeyWithHashAlg::new(Arc::new(decoded_key), rsa_hash),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "[阶段: SSH公钥认证] 请求异常 (耗时: {}ms, 原因: {})",
+                            started.elapsed().as_millis(),
+                            sanitize_error(&e.to_string(), host)
+                        )
+                    })?;
+                let ok = key_res.success();
+                (ok, format!("服务端返回: {:?}", key_res))
+            }
+        };
+
+        if !auth_ok {
+            return Err(anyhow!(
+                "[阶段: SSH身份认证] 真实远端服务器拒绝了凭据 (端口: :{}, 耗时: {}ms, 详情: {})",
+                host.real_port,
+                started.elapsed().as_millis(),
+                auth_diag
+            ));
+        }
+
+        Ok((handle, started.elapsed().as_millis()))
+    };
+
+    match timeout(UPSTREAM_HANDSHAKE_TIMEOUT, connect_fut).await {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!(
+            "[阶段: 上游总超时] 建立上游 SSH 隧道超过 {}s 限制 (代理: {}, 目标端口: :{})",
+            UPSTREAM_HANDSHAKE_TIMEOUT.as_secs(),
+            host.proxy.badge_text(),
+            host.real_port
+        )),
+    }
+}
+
+/// 主动测试指定主机的上游连接、代理穿透、SSH 协议握手与真实凭据认证，返回 `(耗时毫秒, 最新绑定主机公钥)`
+pub async fn test_upstream_connection(host: RelayHost) -> Result<(u128, Option<String>)> {
+    let live_host = Arc::new(RwLock::new(host.clone()));
+    let (handle, elapsed_ms) =
+        connect_and_authenticate_upstream(&host, live_host.clone(), None).await?;
+    let _ = handle
+        .disconnect(
+            Disconnect::ByApplication,
+            "AgentGate connectivity test complete",
+            "en",
+        )
+        .await;
+    let pinned_key = live_host
+        .read()
+        .ok()
+        .and_then(|h| h.pinned_host_key_openssh.clone());
+    Ok((elapsed_ms, pinned_key))
+}
+
+impl UpstreamClientHandler {
     #[cfg(test)]
     fn permissive_for_test() -> Self {
         Self {
@@ -445,241 +686,17 @@ impl LocalSshHandler {
 
         let host = self.current_host();
         let live_host_ref = self.live_host.clone();
-        let event_tx = self.event_tx.clone();
-        let started = Instant::now();
+        let event_tx = Some(self.event_tx.clone());
 
-        let connect_fut = async {
-            let tcp_stream =
-                connect_via_proxy(&host.proxy, &host.real_host, host.real_port).await?;
-
-            let preferred = Preferred {
-                kex: Cow::Borrowed(&[
-                    russh::kex::MLKEM768X25519_SHA256,
-                    russh::kex::CURVE25519,
-                    russh::kex::CURVE25519_PRE_RFC_8731,
-                    russh::kex::ECDH_SHA2_NISTP256,
-                    russh::kex::ECDH_SHA2_NISTP384,
-                    russh::kex::ECDH_SHA2_NISTP521,
-                    russh::kex::DH_GEX_SHA256,
-                    russh::kex::DH_G18_SHA512,
-                    russh::kex::DH_G17_SHA512,
-                    russh::kex::DH_G16_SHA512,
-                    russh::kex::DH_G15_SHA512,
-                    russh::kex::DH_G14_SHA256,
-                    russh::kex::DH_GEX_SHA1,
-                    russh::kex::DH_G14_SHA1,
-                    russh::kex::DH_G1_SHA1,
-                    russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
-                    russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
-                ]),
-                key: Cow::Borrowed(&[
-                    Algorithm::Ed25519,
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP256,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP384,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP521,
-                    },
-                    Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha512),
-                    },
-                    Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha256),
-                    },
-                    Algorithm::Rsa { hash: None },
-                ]),
-                cipher: Cow::Borrowed(&[
-                    russh::cipher::CHACHA20_POLY1305,
-                    russh::cipher::AES_256_GCM,
-                    russh::cipher::AES_128_GCM,
-                    russh::cipher::AES_256_CTR,
-                    russh::cipher::AES_192_CTR,
-                    russh::cipher::AES_128_CTR,
-                    russh::cipher::AES_256_CBC,
-                    russh::cipher::AES_192_CBC,
-                    russh::cipher::AES_128_CBC,
-                ]),
-                mac: Cow::Borrowed(&[
-                    russh::mac::HMAC_SHA512_ETM,
-                    russh::mac::HMAC_SHA256_ETM,
-                    russh::mac::HMAC_SHA512,
-                    russh::mac::HMAC_SHA256,
-                    russh::mac::HMAC_SHA1_ETM,
-                    russh::mac::HMAC_SHA1,
-                ]),
-                ..Preferred::DEFAULT
-            };
-
-            let client_cfg = Arc::new(client::Config {
-                inactivity_timeout: Some(Duration::from_secs(1800)),
-                keepalive_interval: Some(Duration::from_secs(30)),
-                keepalive_max: 6,
-                nodelay: true,
-                preferred,
-                ..Default::default()
-            });
-
-            let mut handle = client::connect_stream(
-                client_cfg,
-                tcp_stream,
-                UpstreamClientHandler::new(live_host_ref, event_tx),
-            )
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "[阶段: SSH协议握手] 协商失败 (代理: {}, 端口: :{}, 耗时: {}ms, 原因: {})",
-                    host.proxy.badge_text(),
-                    host.real_port,
-                    started.elapsed().as_millis(),
-                    sanitize_error(&e.to_string(), &host)
-                )
-            })?;
-
-            let (auth_ok, auth_diag) = match &host.real_auth {
-                RealAuthConfig::Password { password } => {
-                    let pwd_clean = password.trim_matches(['\r', '\n']);
-                    let pwd_res = handle
-                        .authenticate_password(&host.real_user, pwd_clean.to_string())
-                        .await
-                        .map_err(|e| {
-                            anyhow!(
-                                "[阶段: SSH密码认证] 请求异常 (耗时: {}ms, 原因: {})",
-                                started.elapsed().as_millis(),
-                                sanitize_error(&e.to_string(), &host)
-                            )
-                        })?;
-                    if pwd_res.success() {
-                        (true, String::new())
-                    } else {
-                        let remaining_str = format!("{:?}", pwd_res);
-                        // 自动回退尝试 PAM keyboard-interactive 认证
-                        let mut kbd_ok = false;
-                        if let Ok(mut resp) = handle
-                            .authenticate_keyboard_interactive_start(&host.real_user, None)
-                            .await
-                        {
-                            for _ in 0..4 {
-                                match resp {
-                                    client::KeyboardInteractiveAuthResponse::Success => {
-                                        kbd_ok = true;
-                                        break;
-                                    }
-                                    client::KeyboardInteractiveAuthResponse::Failure { .. } => {
-                                        break;
-                                    }
-                                    client::KeyboardInteractiveAuthResponse::InfoRequest {
-                                        prompts,
-                                        ..
-                                    } => {
-                                        let answers = if prompts.is_empty() {
-                                            Vec::new()
-                                        } else {
-                                            vec![pwd_clean.to_string(); prompts.len()]
-                                        };
-                                        match handle
-                                            .authenticate_keyboard_interactive_respond(answers)
-                                            .await
-                                        {
-                                            Ok(next) => resp = next,
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let root_hint = if host.real_user == "root"
-                            && remaining_str.contains("PublicKey")
-                            && remaining_str.contains("Password")
-                        {
-                            " [排查建议: 确认 root 密码无误，或检查远端 /etc/ssh/sshd_config 是否已设置 PermitRootLogin yes（Debian/Ubuntu 默认 prohibit-password 会拒绝 root 密码登录）]"
-                        } else {
-                            ""
-                        };
-                        (
-                            kbd_ok,
-                            format!(
-                                "password 与 keyboard-interactive 均被拒绝 (密码长度: {} 字符, 服务端返回: {}){}",
-                                pwd_clean.chars().count(),
-                                sanitize_error(&remaining_str, &host),
-                                root_hint
-                            ),
-                        )
-                    }
-                }
-                RealAuthConfig::PrivateKey {
-                    private_key_pem,
-                    passphrase,
-                } => {
-                    let decoded_key = decode_secret_key(
-                        private_key_pem,
-                        passphrase.as_deref().filter(|p| !p.is_empty()),
-                    )
-                    .map_err(|e| {
-                        anyhow!(
-                            "[阶段: 本地私钥解析] 解析真实远端私钥失败 ({})",
-                            sanitize_error(&e.to_string(), &host)
-                        )
-                    })?;
-                    let rsa_hash = if decoded_key.algorithm().is_rsa() {
-                        handle
-                            .best_supported_rsa_hash()
-                            .await
-                            .ok()
-                            .flatten()
-                            .flatten()
-                    } else {
-                        None
-                    };
-                    let key_res = handle
-                        .authenticate_publickey(
-                            &host.real_user,
-                            PrivateKeyWithHashAlg::new(Arc::new(decoded_key), rsa_hash),
-                        )
-                        .await
-                        .map_err(|e| {
-                            anyhow!(
-                                "[阶段: SSH公钥认证] 请求异常 (耗时: {}ms, 原因: {})",
-                                started.elapsed().as_millis(),
-                                sanitize_error(&e.to_string(), &host)
-                            )
-                        })?;
-                    let ok = key_res.success();
-                    (ok, format!("服务端返回: {:?}", key_res))
-                }
-            };
-
-            if !auth_ok {
-                return Err(anyhow!(
-                    "[阶段: SSH身份认证] 真实远端服务器拒绝了凭据 (端口: :{}, 耗时: {}ms, 详情: {})",
-                    host.real_port,
-                    started.elapsed().as_millis(),
-                    auth_diag
-                ));
-            }
-
-            Ok(Arc::new(handle))
-        };
-
-        match timeout(UPSTREAM_HANDSHAKE_TIMEOUT, connect_fut).await {
-            Ok(Ok(shared)) => {
+        match connect_and_authenticate_upstream(&host, live_host_ref, event_tx).await {
+            Ok((handle, _)) => {
+                let shared = Arc::new(handle);
                 self.upstream = Some(shared.clone());
                 Ok(shared)
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 self.upstream_failed = true;
                 Err(e)
-            }
-            Err(_) => {
-                self.upstream_failed = true;
-                Err(anyhow!(
-                    "[阶段: 上游总超时] 建立上游 SSH 隧道超过 {}s 限制 (代理: {}, 目标端口: :{})",
-                    UPSTREAM_HANDSHAKE_TIMEOUT.as_secs(),
-                    host.proxy.badge_text(),
-                    host.real_port
-                ))
             }
         }
     }
@@ -779,7 +796,11 @@ impl server::Handler for LocalSshHandler {
                 if creds.mode != AgentAuthMode::EphemeralPassword {
                     false
                 } else if let Some(expected) = &creds.temp_password {
-                    expected.as_bytes().ct_eq(password.as_bytes()).into()
+                    expected
+                        .trim()
+                        .as_bytes()
+                        .ct_eq(password.trim().as_bytes())
+                        .into()
                 } else {
                     false
                 }
@@ -2185,6 +2206,27 @@ mod tests {
         assert_eq!(seen_success, 2, "pty-req and shell must both receive CHANNEL_SUCCESS");
         assert_eq!(seen_failure, 1, "x11-req must explicitly receive CHANNEL_FAILURE");
         assert!(String::from_utf8_lossy(&moba_out).contains("ECHO:moba_cmd_ok"));
+
+        // 验证 test_upstream_connection 可准确探测上游成功与失败耗时
+        let mut probe_host = RelayHost::new_template(2);
+        probe_host.real_host = "127.0.0.1".to_string();
+        probe_host.real_port = remote_port;
+        probe_host.real_user = "root".to_string();
+        probe_host.real_auth = RealAuthConfig::Password {
+            password: "RootPass!2026".to_string(),
+        };
+        let (_elapsed, pinned) = test_upstream_connection(probe_host.clone())
+            .await
+            .expect("upstream test should succeed");
+        assert!(pinned.is_some(), "upstream test should capture TOFU host key");
+
+        probe_host.real_auth = RealAuthConfig::Password {
+            password: "WrongPass".to_string(),
+        };
+        assert!(
+            test_upstream_connection(probe_host).await.is_err(),
+            "upstream test with wrong password must return Err"
+        );
 
         control.stop();
     }

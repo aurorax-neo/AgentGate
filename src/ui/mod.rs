@@ -1,7 +1,7 @@
 pub mod text_input;
 pub mod theme;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use crate::models::{
 use crate::prompt_tpl::render_agent_snippet;
 use crate::ssh_relay::{
     LiveCredentials, RelayEvent, RunningRelayControl, global_tokio_runtime, start_host_relay,
+    test_upstream_connection,
 };
 use crate::storage::EncryptedStorage;
 use crate::tray::{
@@ -70,6 +71,8 @@ struct PersistedUiPrefs {
     #[serde(default)]
     pub log_scope: LogScope,
     pub selected_host_id: Option<Uuid>,
+    #[serde(default)]
+    pub running_host_ids: Option<Vec<Uuid>>,
 }
 
 impl Default for PersistedUiPrefs {
@@ -78,6 +81,7 @@ impl Default for PersistedUiPrefs {
             is_dark: true,
             log_scope: LogScope::SelectedHost,
             selected_host_id: None,
+            running_host_ids: None,
         }
     }
 }
@@ -111,6 +115,9 @@ pub struct AgentGateWorkbench {
     selected_host_id: Option<Uuid>,
     show_host_modal: bool,
     form_error: Option<String>,
+    form_test_ok: Option<String>,
+    form_testing: bool,
+    testing_host_ids: HashSet<Uuid>,
     pending_confirm: Option<PendingAction>,
     status_banner: Option<(String, bool)>,
 
@@ -242,6 +249,9 @@ impl AgentGateWorkbench {
             selected_host_id,
             show_host_modal: false,
             form_error: None,
+            form_test_ok: None,
+            form_testing: false,
+            testing_host_ids: HashSet::new(),
             pending_confirm: None,
             status_banner: Some(("就绪".to_string(), false)),
             search_input,
@@ -268,6 +278,24 @@ impl AgentGateWorkbench {
         this.sync_inputs_theme(cx);
         this.reset_form_for_new_host(cx);
         this.apply_optional_demo_seed(cx);
+
+        // 自动恢复上次退出前处于运行中的中转主机（保持固定端口与固定密码不中断）
+        let resume_ids: Vec<Uuid> = prefs
+            .running_host_ids
+            .clone()
+            .unwrap_or_else(|| this.hosts.iter().map(|h| h.id).collect());
+        for resume_id in &resume_ids {
+            if this.controls.contains_key(resume_id) {
+                continue;
+            }
+            if let Some(host) = this.hosts.iter().find(|h| &h.id == resume_id).cloned() {
+                let rt = this.runtimes.entry(host.id).or_default();
+                rt.current_temp_password = Some(host.agent_password.clone());
+                rt.status = RelayStatus::Starting;
+                let live_creds = Self::build_live_credentials(&host, rt);
+                this.spawn_start_relay_async(host, live_creds, false, cx);
+            }
+        }
 
         // 后台事件轮询器：将 Tokio SSH 中转事件同步到 GPUI 界面
         cx.spawn(async move |weak_this, cx| {
@@ -368,10 +396,19 @@ impl AgentGateWorkbench {
     }
 
     fn save_ui_prefs(&self) {
+        let mut running_host_ids: Vec<Uuid> = self.controls.keys().copied().collect();
+        for (id, rt) in &self.runtimes {
+            if (rt.status.is_running() || matches!(rt.status, RelayStatus::Starting))
+                && !running_host_ids.contains(id)
+            {
+                running_host_ids.push(*id);
+            }
+        }
         let prefs = PersistedUiPrefs {
             is_dark: self.is_dark,
             log_scope: self.log_scope,
             selected_host_id: self.selected_host_id,
+            running_host_ids: Some(running_host_ids),
         };
         if let Ok(json) = serde_json::to_string_pretty(&prefs) {
             let _ = fs::write(self.storage.base_dir().join("ui_state.json"), json);
@@ -692,6 +729,8 @@ impl AgentGateWorkbench {
     fn reset_form_for_new_host(&mut self, cx: &mut Context<Self>) {
         self.editing_host_id = None;
         self.form_error = None;
+        self.form_test_ok = None;
+        self.form_testing = false;
         let next_codename = RelayHost::generate_codename(self.hosts.len());
         let default_bind = RelayHost::default_local_bind_host();
         let free_port = RelayHost::allocate_free_local_port(&default_bind);
@@ -724,6 +763,8 @@ impl AgentGateWorkbench {
     fn populate_form_from_host(&mut self, host: &RelayHost, cx: &mut Context<Self>) {
         self.editing_host_id = Some(host.id);
         self.form_error = None;
+        self.form_test_ok = None;
+        self.form_testing = false;
         self.form_codename
             .update(cx, |f, cx| f.set_text(host.codename.clone(), cx));
         self.form_label
@@ -1037,6 +1078,7 @@ impl AgentGateWorkbench {
                                     active_sessions: 0,
                                 };
                             }
+                            this.save_ui_prefs();
                             if update_banner_on_ok {
                                 this.status_banner = Some((
                                     format!(
@@ -1051,8 +1093,98 @@ impl AgentGateWorkbench {
                             if let Some(rt) = this.runtimes.get_mut(&id) {
                                 rt.status = RelayStatus::Error(err.to_string());
                             }
+                            this.save_ui_prefs();
                             this.status_banner =
                                 Some((format!("启动代号 [{}] 失败: {}", codename, err), true));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 异步测试上游真实 SSH 主机连通性、代理握手与身份认证（支持在主界面与新建/编辑弹窗中直接调用）
+    fn spawn_test_upstream(
+        &mut self,
+        host: RelayHost,
+        from_modal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let id = host.id;
+        let codename = host.codename.clone();
+        self.testing_host_ids.insert(id);
+        if from_modal {
+            self.form_testing = true;
+            self.form_error = None;
+            self.form_test_ok = None;
+        }
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.push_log(
+                &codename,
+                "发起上游测试",
+                format!(
+                    "正在测试上游连接 (代理: {}, 认证: {})",
+                    host.proxy.badge_text(),
+                    host.real_auth.label()
+                ),
+                false,
+            );
+        }
+        self.status_banner = Some((
+            format!("正在测试代号 [{}] 的上游 SSH 连接与凭据...", codename),
+            false,
+        ));
+        cx.notify();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        global_tokio_runtime().spawn(async move {
+            let res = test_upstream_connection(host).await;
+            let _ = done_tx.send(res);
+        });
+
+        cx.spawn(async move |weak_this, cx| {
+            if let Ok(test_res) = done_rx.await {
+                let _ = weak_this.update(cx, |this, cx| {
+                    this.testing_host_ids.remove(&id);
+                    if from_modal {
+                        this.form_testing = false;
+                    }
+                    match test_res {
+                        Ok((elapsed_ms, pinned_key)) => {
+                            if let Some(pk) = pinned_key
+                                && let Some(h) = this.hosts.iter_mut().find(|h| h.id == id)
+                                && h.pinned_host_key_openssh.is_none()
+                            {
+                                h.pinned_host_key_openssh = Some(pk);
+                                let _ = this.storage.save_hosts(&this.hosts);
+                            }
+                            let detail = format!("连接与认证通过 (耗时: {}ms)", elapsed_ms);
+                            if let Some(rt) = this.runtimes.get_mut(&id) {
+                                rt.push_log(&codename, "上游测试成功", detail.clone(), false);
+                            }
+                            this.status_banner = Some((
+                                format!("代号 [{}] 上游测试成功 — {}", codename, detail),
+                                false,
+                            ));
+                            if from_modal {
+                                this.form_test_ok =
+                                    Some(format!("上游测试成功：{}", detail));
+                            }
+                        }
+                        Err(err) => {
+                            let err_str = err.to_string();
+                            if let Some(rt) = this.runtimes.get_mut(&id) {
+                                rt.push_log(&codename, "上游测试失败", err_str.clone(), true);
+                            }
+                            this.status_banner = Some((
+                                format!("代号 [{}] 上游测试失败 — {}", codename, err_str),
+                                true,
+                            ));
+                            if from_modal {
+                                this.form_error = Some(format!("上游测试失败 — {}", err_str));
+                            }
                         }
                     }
                     cx.notify();
@@ -1122,6 +1254,7 @@ impl AgentGateWorkbench {
                 if let Some(rt) = self.runtimes.get_mut(&id) {
                     rt.status = RelayStatus::Stopped;
                 }
+                self.save_ui_prefs();
                 self.status_banner = Some((
                     format!("已停止代号 [{}] 在端口 {} 的中转服务（端口与密码保持不变）", codename, local_port),
                     false,
@@ -1136,6 +1269,7 @@ impl AgentGateWorkbench {
                         rt.status = RelayStatus::Stopped;
                     }
                 }
+                self.save_ui_prefs();
                 self.status_banner = Some((
                     format!("已停止全部 {} 条本地 SSH 中转服务", running_count),
                     false,
@@ -1938,6 +2072,27 @@ impl AgentGateWorkbench {
                                                         id: selected_id,
                                                         codename: c_toggle.clone(),
                                                     },
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                    })
+                                    .child({
+                                        let host_test = host.clone();
+                                        let is_testing =
+                                            self.testing_host_ids.contains(&selected_id);
+                                        action_button(
+                                            "detail-test-upstream",
+                                            if is_testing { "测试中..." } else { "测试" },
+                                            theme,
+                                            !is_testing,
+                                            false,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this.testing_host_ids.contains(&selected_id) {
+                                                this.spawn_test_upstream(
+                                                    host_test.clone(),
+                                                    false,
                                                     cx,
                                                 );
                                             }
@@ -3048,14 +3203,60 @@ impl AgentGateWorkbench {
                                 div()
                                     .flex_1()
                                     .text_size(px(12.))
-                                    .text_color(theme.danger)
-                                    .child(self.form_error.clone().unwrap_or_default()),
+                                    .text_color(if self.form_error.is_some() {
+                                        theme.danger
+                                    } else if self.form_test_ok.is_some() {
+                                        theme.success
+                                    } else {
+                                        theme.accent_hover
+                                    })
+                                    .child(
+                                        self.form_error
+                                            .clone()
+                                            .or_else(|| self.form_test_ok.clone())
+                                            .unwrap_or_else(|| {
+                                                if self.form_testing {
+                                                    "正在连接上游服务器验证代理与凭据...".to_string()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            }),
+                                    ),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap_2()
+                                    .child(
+                                        action_button(
+                                            "form-test-upstream",
+                                            if self.form_testing {
+                                                "测试中..."
+                                            } else {
+                                                "测试连接"
+                                            },
+                                            theme,
+                                            !self.form_testing,
+                                            false,
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.form_testing {
+                                                return;
+                                            }
+                                            match this.validate_and_build_host(cx) {
+                                                Ok((host, _)) => {
+                                                    this.spawn_test_upstream(host, true, cx);
+                                                }
+                                                Err(err_msg) => {
+                                                    this.form_error = Some(err_msg.clone());
+                                                    this.form_test_ok = None;
+                                                    this.status_banner = Some((err_msg, true));
+                                                    cx.notify();
+                                                }
+                                            }
+                                        })),
+                                    )
                                     .child(
                                         action_button(
                                             "form-modal-cancel",
@@ -3067,6 +3268,8 @@ impl AgentGateWorkbench {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.show_host_modal = false;
                                             this.form_error = None;
+                                            this.form_test_ok = None;
+                                            this.form_testing = false;
                                             cx.notify();
                                         })),
                                     )

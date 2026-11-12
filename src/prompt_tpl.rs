@@ -50,7 +50,7 @@ pub fn render_agent_snippet_with_null_dev(
                      Host: {bind_host}\n\
                      Port: {local_port}\n\
                      User: {codename}\n\
-                     AuthMode: TemporaryPassword\n\
+                     AuthMode: Password\n\
                      Password: {temp_pwd}\n\
                      Command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts_dev} -p {local_port} {codename}@{bind_host}"
                 ))
