@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-12
+
+### 🐛 Bug Fixes
+- 修复连接 MikroTik RouterOS (`ROSSSH`) 等通告 `cipher = none` 的设备时返回 `MethodSet([])` 拒绝认证的问题：彻底移除上游 `Preferred` 中的 `russh::cipher::NONE` 与 `CLEAR`，按现代 AEAD/CTR 优先、传统 CBC 兜底顺序排列算法，并补齐 `ext-info-c` 与 `kex-strict-c-v00@openssh.com` 扩展协商
+
 ## [0.1.5] - 2026-11-12
 
 ### 🚀 Features

@@ -442,13 +442,25 @@ impl LocalSshHandler {
                 connect_via_proxy(&host.proxy, &host.real_host, host.real_port).await?;
 
             let preferred = Preferred {
-                kex: Cow::Owned(
-                    russh::kex::ALL_KEX_ALGORITHMS
-                        .iter()
-                        .filter(|n| ***n != russh::kex::NONE)
-                        .map(|n| **n)
-                        .collect(),
-                ),
+                kex: Cow::Borrowed(&[
+                    russh::kex::MLKEM768X25519_SHA256,
+                    russh::kex::CURVE25519,
+                    russh::kex::CURVE25519_PRE_RFC_8731,
+                    russh::kex::ECDH_SHA2_NISTP256,
+                    russh::kex::ECDH_SHA2_NISTP384,
+                    russh::kex::ECDH_SHA2_NISTP521,
+                    russh::kex::DH_GEX_SHA256,
+                    russh::kex::DH_G18_SHA512,
+                    russh::kex::DH_G17_SHA512,
+                    russh::kex::DH_G16_SHA512,
+                    russh::kex::DH_G15_SHA512,
+                    russh::kex::DH_G14_SHA256,
+                    russh::kex::DH_GEX_SHA1,
+                    russh::kex::DH_G14_SHA1,
+                    russh::kex::DH_G1_SHA1,
+                    russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                    russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+                ]),
                 key: Cow::Borrowed(&[
                     Algorithm::Ed25519,
                     Algorithm::Ecdsa {
@@ -468,20 +480,25 @@ impl LocalSshHandler {
                     },
                     Algorithm::Rsa { hash: None },
                 ]),
-                cipher: Cow::Owned(
-                    russh::cipher::ALL_CIPHERS
-                        .iter()
-                        .filter(|n| ***n != russh::cipher::CLEAR)
-                        .map(|n| **n)
-                        .collect(),
-                ),
-                mac: Cow::Owned(
-                    russh::mac::ALL_MAC_ALGORITHMS
-                        .iter()
-                        .filter(|n| ***n != russh::mac::NONE)
-                        .map(|n| **n)
-                        .collect(),
-                ),
+                cipher: Cow::Borrowed(&[
+                    russh::cipher::CHACHA20_POLY1305,
+                    russh::cipher::AES_256_GCM,
+                    russh::cipher::AES_128_GCM,
+                    russh::cipher::AES_256_CTR,
+                    russh::cipher::AES_192_CTR,
+                    russh::cipher::AES_128_CTR,
+                    russh::cipher::AES_256_CBC,
+                    russh::cipher::AES_192_CBC,
+                    russh::cipher::AES_128_CBC,
+                ]),
+                mac: Cow::Borrowed(&[
+                    russh::mac::HMAC_SHA512_ETM,
+                    russh::mac::HMAC_SHA256_ETM,
+                    russh::mac::HMAC_SHA512,
+                    russh::mac::HMAC_SHA256,
+                    russh::mac::HMAC_SHA1_ETM,
+                    russh::mac::HMAC_SHA1,
+                ]),
                 ..Preferred::DEFAULT
             };
 
