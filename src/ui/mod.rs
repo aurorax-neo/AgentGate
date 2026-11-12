@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use gpui::{
     App, ClipboardItem, Context, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
-    MouseButton, SharedString, Stateful, Window, WindowControlArea, actions, div, hsla, prelude::*,
-    px, rgb,
+    MouseButton, PathBuilder, SharedString, Stateful, Window, WindowControlArea, actions, canvas,
+    div, hsla, point, prelude::*, px, rgb,
 };
 use russh::keys::ssh_key::PrivateKey;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use crate::ssh_relay::{
 use crate::storage::EncryptedStorage;
 use crate::tray::{
     TrayCommand, is_window_visible, platform_set_window_visible, platform_toggle_maximize_window,
-    poll_tray_command,
+    poll_tray_command, restore_normal_window_level,
 };
 use crate::ui::text_input::{TextField, bind_text_input_keys};
 use crate::ui::theme::WorkbenchTheme;
@@ -281,6 +281,15 @@ impl AgentGateWorkbench {
                                 platform_set_window_visible(next);
                                 if next {
                                     Self::activate_gpui_windows(cx);
+                                    cx.spawn(async move |_, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(120))
+                                            .await;
+                                        let _ = cx.update(|_cx| {
+                                            restore_normal_window_level();
+                                        });
+                                    })
+                                    .detach();
                                 }
                                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                                 Self::sync_linux_gpui_window_visibility(next, cx);
@@ -288,6 +297,15 @@ impl AgentGateWorkbench {
                             TrayCommand::ShowWindow => {
                                 platform_set_window_visible(true);
                                 Self::activate_gpui_windows(cx);
+                                cx.spawn(async move |_, cx| {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(120))
+                                        .await;
+                                    let _ = cx.update(|_cx| {
+                                        restore_normal_window_level();
+                                    });
+                                })
+                                .detach();
                                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                                 Self::sync_linux_gpui_window_visibility(true, cx);
                             }
@@ -3463,20 +3481,66 @@ fn theme_icon_button(
         })
 }
 
-/// 渲染纯几何小眼睛显隐控制图标按钮（is_visible=true 显示睁眼图标，false 显示带斜杠闭眼图标）
+/// 辅助函数：将点序列按斜线走廊 `|x - y| / sqrt(2) >= gap` 切分为多段连续折线并绘制
+fn paint_clipped_polyline(
+    window: &mut Window,
+    pts: &[(f32, f32)],
+    center: gpui::Point<gpui::Pixels>,
+    scale: f32,
+    stroke_width: gpui::Pixels,
+    color: gpui::Rgba,
+    clip_slash_gap: Option<f32>,
+) {
+    let mut current_seg: Vec<gpui::Point<gpui::Pixels>> = Vec::new();
+    for &(lx, ly) in pts {
+        let keep = if let Some(gap) = clip_slash_gap {
+            ((lx - ly).abs() * std::f32::consts::FRAC_1_SQRT_2) >= gap
+        } else {
+            true
+        };
+        if keep {
+            current_seg.push(point(center.x + px(lx * scale), center.y + px(ly * scale)));
+        } else if current_seg.len() >= 2 {
+            let mut pb = PathBuilder::stroke(stroke_width);
+            pb.move_to(current_seg[0]);
+            for &pt in &current_seg[1..] {
+                pb.line_to(pt);
+            }
+            if let Ok(path) = pb.build() {
+                window.paint_path(path, color);
+            }
+            current_seg.clear();
+        } else {
+            current_seg.clear();
+        }
+    }
+    if current_seg.len() >= 2 {
+        let mut pb = PathBuilder::stroke(stroke_width);
+        pb.move_to(current_seg[0]);
+        for &pt in &current_seg[1..] {
+            pb.line_to(pt);
+        }
+        if let Ok(path) = pb.build() {
+            window.paint_path(path, color);
+        }
+    }
+}
+
+/// 渲染矢量小眼睛显隐控制图标按钮（is_visible=true 绘制杏仁眼框+空心圆瞳孔，false 绘制分段眼框+斜杠）
 fn eye_icon_button(
     id: impl Into<ElementId>,
     is_visible: bool,
     theme: WorkbenchTheme,
 ) -> Stateful<gpui::Div> {
     let stroke = if is_visible {
-        theme.accent_hover
+        theme.text_primary
     } else {
         theme.text_secondary
     };
     div()
         .id(id)
-        .size(px(26.))
+        .w(px(28.))
+        .h(px(26.))
         .rounded(px(5.))
         .border_1()
         .border_color(theme.border)
@@ -3487,35 +3551,59 @@ fn eye_icon_button(
         .cursor_pointer()
         .hover(move |s| s.bg(theme.bg_subtle))
         .child(
-            div()
-                .w(px(14.))
-                .h(px(9.))
-                .rounded(px(5.))
-                .border_1()
-                .border_color(stroke)
-                .flex()
-                .items_center()
-                .justify_center()
-                .relative()
-                .child(
-                    div()
-                        .size(px(4.5))
-                        .rounded(px(2.5))
-                        .bg(if is_visible {
-                            stroke
-                        } else {
-                            theme.text_muted
-                        }),
-                )
-                .when(!is_visible, |eye| {
-                    eye.child(
-                        div()
-                            .absolute()
-                            .w(px(14.))
-                            .h(px(1.5))
-                            .bg(theme.danger),
-                    )
-                }),
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let center = bounds.center();
+                    // 采用 Lucide 24x24 标准比例（眼宽 20，眼高 14.4，中心圆瞳孔半径 3.3）
+                    let scale = 0.74_f32;
+                    let sw = px(1.55);
+                    let gap = if is_visible { None } else { Some(2.45_f32) };
+
+                    // 上眼睑与下眼睑完整采样（饱满圆润杏仁形）
+                    let steps = 40usize;
+                    let mut upper = Vec::with_capacity(steps + 1);
+                    let mut lower = Vec::with_capacity(steps + 1);
+                    for i in 0..=steps {
+                        let u = (i as f32) / (steps as f32);
+                        let x = -10.0 + 20.0 * u;
+                        let y = 7.2 * (u * std::f32::consts::PI).sin();
+                        upper.push((x, -y));
+                        lower.push((x, y));
+                    }
+                    paint_clipped_polyline(window, &upper, center, scale, sw, stroke, gap);
+                    paint_clipped_polyline(window, &lower, center, scale, sw, stroke, gap);
+
+                    // 中心空心圆瞳孔（半径 3.3）
+                    let pupil_steps = 48usize;
+                    let r = 3.3_f32;
+                    let mut pupil = Vec::with_capacity(pupil_steps + 1);
+                    for i in 0..=pupil_steps {
+                        // 从 45°（斜线处）开始采样，确保闭眼态下圆弧起止点自然对齐斜线缺口
+                        let ang = std::f32::consts::FRAC_PI_4
+                            + (i as f32) * std::f32::consts::TAU / (pupil_steps as f32);
+                        pupil.push((r * ang.cos(), r * ang.sin()));
+                    }
+                    paint_clipped_polyline(window, &pupil, center, scale, sw, stroke, gap);
+
+                    // 闭眼态绘制左上到右下贯穿斜杠
+                    if !is_visible {
+                        let mut slash = PathBuilder::stroke(sw);
+                        slash.move_to(point(
+                            center.x + px(-8.4 * scale),
+                            center.y + px(-8.4 * scale),
+                        ));
+                        slash.line_to(point(
+                            center.x + px(8.4 * scale),
+                            center.y + px(8.4 * scale),
+                        ));
+                        if let Ok(path) = slash.build() {
+                            window.paint_path(path, stroke);
+                        }
+                    }
+                },
+            )
+            .size(px(18.)),
         )
 }
 

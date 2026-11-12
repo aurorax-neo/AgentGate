@@ -370,7 +370,7 @@ struct LocalSshHandler {
     session_counted: bool,
     upstream_failed: bool,
     upstream: Option<Arc<client::Handle<UpstreamClientHandler>>>,
-    channels: Arc<AsyncMutex<HashMap<ChannelId, ChannelWriteHalf<client::Msg>>>>,
+    channels: Arc<AsyncMutex<HashMap<ChannelId, Arc<ChannelWriteHalf<client::Msg>>>>>,
 }
 
 impl LocalSshHandler {
@@ -660,7 +660,7 @@ impl LocalSshHandler {
         mut upstream_read: ChannelReadHalf,
         server_handle: server::Handle,
         local_id: ChannelId,
-        channels: Arc<AsyncMutex<HashMap<ChannelId, ChannelWriteHalf<client::Msg>>>>,
+        channels: Arc<AsyncMutex<HashMap<ChannelId, Arc<ChannelWriteHalf<client::Msg>>>>>,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = upstream_read.wait().await {
@@ -704,12 +704,6 @@ impl LocalSshHandler {
                         let _ = server_handle
                             .xon_xoff_request(local_id, client_can_do)
                             .await;
-                    }
-                    ChannelMsg::Success => {
-                        let _ = server_handle.channel_success(local_id).await;
-                    }
-                    ChannelMsg::Failure => {
-                        let _ = server_handle.channel_failure(local_id).await;
                     }
                     ChannelMsg::Eof => {
                         let _ = server_handle.eof(local_id).await;
@@ -911,9 +905,12 @@ impl server::Handler for LocalSshHandler {
 
         match upstream.channel_open_session().await {
             Ok(up_chan) => {
-                reply.accept().await;
                 let (upstream_read, upstream_write) = up_chan.split();
-                self.channels.lock().await.insert(local_id, upstream_write);
+                self.channels
+                    .lock()
+                    .await
+                    .insert(local_id, Arc::new(upstream_write));
+                reply.accept().await;
                 Self::spawn_upstream_to_local_bridge(
                     upstream_read,
                     session.handle(),
@@ -971,9 +968,12 @@ impl server::Handler for LocalSshHandler {
                     format!("direct-tcpip -> {}:{}", host_to_connect, port_to_connect),
                     false,
                 );
-                reply.accept().await;
                 let (upstream_read, upstream_write) = up_chan.split();
-                self.channels.lock().await.insert(local_id, upstream_write);
+                self.channels
+                    .lock()
+                    .await
+                    .insert(local_id, Arc::new(upstream_write));
+                reply.accept().await;
                 Self::spawn_upstream_to_local_bridge(
                     upstream_read,
                     session.handle(),
@@ -999,11 +999,11 @@ impl server::Handler for LocalSshHandler {
         modes: &[(Pty, u32)],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             if up
                 .request_pty(
-                    true,
+                    false,
                     term,
                     col_width,
                     row_height,
@@ -1012,8 +1012,10 @@ impl server::Handler for LocalSshHandler {
                     modes,
                 )
                 .await
-                .is_err()
+                .is_ok()
             {
+                let _ = session.channel_success(channel);
+            } else {
                 let _ = session.channel_failure(channel);
             }
         } else {
@@ -1028,9 +1030,11 @@ impl server::Handler for LocalSshHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         self.emit_log("交互终端", "Agent 请求打开交互式 Shell", false);
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
-            if up.request_shell(true).await.is_err() {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
+            if up.request_shell(false).await.is_ok() {
+                let _ = session.channel_success(channel);
+            } else {
                 let _ = session.channel_failure(channel);
             }
         } else {
@@ -1048,9 +1052,11 @@ impl server::Handler for LocalSshHandler {
         let cmd_preview: String = String::from_utf8_lossy(data).chars().take(100).collect();
         self.emit_log("执行命令", format!("exec: {}", cmd_preview), false);
 
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
-            if up.exec(true, data).await.is_err() {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
+            if up.exec(false, data).await.is_ok() {
+                let _ = session.channel_success(channel);
+            } else {
                 let _ = session.channel_failure(channel);
             }
         } else {
@@ -1066,9 +1072,11 @@ impl server::Handler for LocalSshHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         self.emit_log("子系统请求", format!("subsystem: {}", name), false);
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
-            if up.request_subsystem(true, name).await.is_err() {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
+            if up.request_subsystem(false, name).await.is_ok() {
+                let _ = session.channel_success(channel);
+            } else {
                 let _ = session.channel_failure(channel);
             }
         } else {
@@ -1084,15 +1092,10 @@ impl server::Handler for LocalSshHandler {
         variable_value: &str,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
-            if up
-                .set_env(true, variable_name, variable_value)
-                .await
-                .is_err()
-            {
-                let _ = session.channel_failure(channel);
-            }
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
+            let _ = up.set_env(false, variable_name, variable_value).await;
+            let _ = session.channel_success(channel);
         } else {
             let _ = session.channel_failure(channel);
         }
@@ -1106,13 +1109,14 @@ impl server::Handler for LocalSshHandler {
         row_height: u32,
         pix_width: u32,
         pix_height: u32,
-        _session: &mut ServerSession,
+        session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             let _ = up
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await;
+            let _ = session.channel_success(channel);
         }
         Ok(())
     }
@@ -1123,8 +1127,8 @@ impl server::Handler for LocalSshHandler {
         signal: Sig,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             let _ = up.signal(signal).await;
         }
         Ok(())
@@ -1136,8 +1140,8 @@ impl server::Handler for LocalSshHandler {
         data: &[u8],
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             let _ = up.data_bytes(Bytes::copy_from_slice(data)).await;
         }
         Ok(())
@@ -1150,8 +1154,8 @@ impl server::Handler for LocalSshHandler {
         data: &[u8],
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             let _ = up
                 .extended_data_bytes(code, Bytes::copy_from_slice(data))
                 .await;
@@ -1164,8 +1168,8 @@ impl server::Handler for LocalSshHandler {
         channel: ChannelId,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        let guard = self.channels.lock().await;
-        if let Some(up) = guard.get(&channel) {
+        let up = self.channels.lock().await.get(&channel).cloned();
+        if let Some(up) = up {
             let _ = up.eof().await;
         }
         Ok(())
@@ -1282,13 +1286,69 @@ mod tests {
             session: &mut ServerSession,
         ) -> Result<(), Self::Error> {
             let cmd = String::from_utf8_lossy(data);
+            let _ = session.channel_success(channel);
             let handle = session.handle();
-            let _ = handle.channel_success(channel).await;
             let response = format!("REMOTE_EXEC_OK:{}\n", cmd.trim());
             let _ = handle.data(channel, Bytes::from(response)).await;
             let _ = handle.exit_status_request(channel, 0).await;
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            _term: &str,
+            _col_width: u32,
+            _row_height: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+            _modes: &[(Pty, u32)],
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            let _ = session.channel_success(channel);
+            Ok(())
+        }
+
+        async fn env_request(
+            &mut self,
+            channel: ChannelId,
+            _variable_name: &str,
+            _variable_value: &str,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            // 模拟 Debian sshd 默认拒绝未在 AcceptEnv 中的环境变量
+            let _ = session.channel_failure(channel);
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            let _ = session.channel_success(channel);
+            let handle = session.handle();
+            let _ = handle.data(channel, Bytes::from("SHELL_READY$ ")).await;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            let input = String::from_utf8_lossy(data);
+            let handle = session.handle();
+            let reply = format!("ECHO:{}", input);
+            let _ = handle.data(channel, Bytes::from(reply)).await;
+            if input.contains("exit") {
+                let _ = handle.exit_status_request(channel, 0).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            }
             Ok(())
         }
     }
@@ -1445,6 +1505,46 @@ mod tests {
             }
         }
         assert_eq!(String::from_utf8_lossy(&out2), "REMOTE_EXEC_OK:whoami\n");
+
+        // 验证交互式 PTY + env + Shell + 双向终端流不会卡死
+        let mut shell_chan = key_session
+            .channel_open_session()
+            .await
+            .expect("open interactive shell chan");
+        shell_chan
+            .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
+            .await
+            .expect("request pty");
+        shell_chan
+            .set_env(false, "LANG", "zh_CN.UTF-8")
+            .await
+            .expect("set env");
+        shell_chan
+            .request_shell(true)
+            .await
+            .expect("request shell");
+        shell_chan
+            .data(&b"hello_pty\nexit\n"[..])
+            .await
+            .expect("send interactive input");
+
+        let mut shell_out = Vec::new();
+        let mut got_pty_success = 0usize;
+        while let Some(msg) = timeout(Duration::from_secs(3), shell_chan.wait())
+            .await
+            .expect("interactive shell should not hang")
+        {
+            match msg {
+                ChannelMsg::Success => got_pty_success += 1,
+                ChannelMsg::Data { data } => shell_out.extend_from_slice(&data),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(got_pty_success, 2, "both pty-req and shell should receive CHANNEL_SUCCESS");
+        let shell_str = String::from_utf8_lossy(&shell_out);
+        assert!(shell_str.contains("SHELL_READY$ "));
+        assert!(shell_str.contains("ECHO:hello_pty"));
 
         control.stop();
     }

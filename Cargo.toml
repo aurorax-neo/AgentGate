@@ -1,6 +1,6 @@
 [package]
 name = "agent-gate"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 build = "build.rs"
 description = "Local SSH isolation relay workbench for AI Agents built with Rust and GPUI"

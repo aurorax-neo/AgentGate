@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-12
+
+### 🚀 Features
+- 重绘密码显隐矢量小眼睛图标：采用标准 Lucide `24x24` 饱满杏仁眼比例（眼宽 `20`、眼高 `14.4`、空心圆瞳孔半径 `3.3`），闭眼态自动按斜线走廊裁切分段缺口并绘制左上至右下贯穿斜杠
+
+### 🐛 Bug Fixes
+- 修复交互式 SSH 终端连接后卡死的问题：在 `pty_request`、`env_request`、`shell_request`、`exec_request`、`subsystem_request`、`window_change_request` 中向远端转发后立即同步调用 `session.channel_success(channel)`，并将通道写半部升级为无跨 `.await` 锁持有的 `Arc<ChannelWriteHalf>`，解决客户端连续发送 `pty-req + env + shell` 时 `CHANNEL_SUCCESS` 被覆盖丢失的问题
+- 修复 macOS 与 Windows 端窗口最大化与还原问题：macOS 端为绿色缩放按钮挂载 `NSClickGestureRecognizer` 绕过 `Accessory` 模式下失效的私有 handoff 追踪；Windows 端改用主线程隐藏 Owner 窗口移除任务栏图标并全量使用 `ShowWindowAsync` 异步投递，避免在 `on_input` 持有 GPUI `Window` 借用期间同步重入 `WM_SIZE` 导致布局不刷新或最大化遮挡任务栏
+- 修复菜单栏右键「显示 / 隐藏工作台」失效及窗口过度置顶问题：右键菜单按 `is_window_currently_shown()` 确定性切换显隐，拉起时脉冲置顶并在同一事件帧末尾立即恢复 `NSNormalWindowLevel (0)`，确保其他窗口获得焦点时正常覆盖在本程序上方
+
 ## [0.1.4] - 2026-11-11
 
 ### 🐛 Bug Fixes

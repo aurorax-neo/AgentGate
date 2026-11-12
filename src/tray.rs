@@ -389,6 +389,12 @@ pub fn platform_set_window_visible(visible: bool) {
     linux_tray::set_visible(visible);
 }
 
+/// 将临时置顶的主窗口恢复为普通窗口层级（macOS 下用于跨应用激活后恢复正常 Z 序交互）
+pub fn restore_normal_window_level() {
+    #[cfg(target_os = "macos")]
+    macos_tray::restore_normal_level();
+}
+
 /// 在系统层面切换主窗口的最大化与还原状态
 pub fn platform_toggle_maximize_window(window: &gpui::Window) {
     #[cfg(target_os = "windows")]
@@ -585,8 +591,44 @@ mod macos_tray {
         let zoom_btn: id = unsafe { msg_send![win, standardWindowButton: NS_WINDOW_ZOOM_BUTTON] };
         if zoom_btn != nil {
             let _: () = unsafe { msg_send![zoom_btn, setEnabled: YES] };
-            let _: () = unsafe { msg_send![zoom_btn, setTarget: win] };
-            let _: () = unsafe { msg_send![zoom_btn, setAction: sel!(zoom:)] };
+            // 为绿色缩放按钮挂载 NSClickGestureRecognizer，绕过 macOS 15+ Accessory 模式下失效的私有 handoff 追踪
+            let recognizers: id = unsafe { msg_send![zoom_btn, gestureRecognizers] };
+            let count: usize = if recognizers != nil {
+                unsafe { msg_send![recognizers, count] }
+            } else {
+                0
+            };
+            if count == 0 {
+                let gr: id = unsafe { msg_send![class!(NSClickGestureRecognizer), alloc] };
+                let gr: id = unsafe {
+                    msg_send![gr, initWithTarget: win action: sel!(zoom:)]
+                };
+                if gr != nil {
+                    let _: () = unsafe { msg_send![zoom_btn, addGestureRecognizer: gr] };
+                    let _: () = unsafe { msg_send![gr, release] };
+                }
+            }
+        }
+    }
+
+    /// 检测主窗口当前是否处于显示且未最小化状态（供右键菜单「显示 / 隐藏工作台」确定性切换）
+    pub fn is_window_currently_shown() -> bool {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, windows];
+            let count: usize = msg_send![windows, count];
+            for i in 0..count {
+                let win: id = msg_send![windows, objectAtIndex: i];
+                if !is_gpui_main_window(win) {
+                    continue;
+                }
+                let is_vis: BOOL = msg_send![win, isVisible];
+                let is_mini: BOOL = msg_send![win, isMiniaturized];
+                if is_vis == YES && is_mini == NO {
+                    return true;
+                }
+            }
+            false
         }
     }
 
@@ -632,7 +674,9 @@ mod macos_tray {
             if is_right_click {
                 let menu_ptr = STATUS_MENU_PTR.load(Ordering::SeqCst);
                 if menu_ptr != 0 {
-                    let was_vis = is_window_actually_front_and_visible();
+                    // 右键菜单「显示 / 隐藏工作台」严格按窗口当前是否显示（isVisible && !isMiniaturized）切换，
+                    // 避免前方有其他窗口（如 ChatGPT）部分重叠时点击无法隐藏
+                    let was_vis = is_window_currently_shown();
                     WAS_VISIBLE_BEFORE_MENU.store(was_vis, Ordering::SeqCst);
                     PENDING_MENU_ACTION.store(0, Ordering::SeqCst);
                     let menu = menu_ptr as id;
@@ -827,6 +871,8 @@ mod macos_tray {
                     if is_mini == YES {
                         let _: () = msg_send![win, deminiaturize: nil];
                     }
+                    // 临时提升到 NSFloatingWindowLevel (3)，突破 macOS 14+ 对非活跃 Accessory 应用的置顶拦截
+                    let _: () = msg_send![win, setLevel: 3_i64];
                     let _: () = msg_send![win, makeKeyAndOrderFront: nil];
                     let _: () = msg_send![win, orderFrontRegardless];
                 } else {
@@ -848,8 +894,31 @@ mod macos_tray {
                     let _: () = msg_send![app, activate];
                 }
                 let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+                // 激活完成后立即在当前事件帧内恢复为普通窗口层级 (NSNormalWindowLevel = 0)，
+                // 确保其他应用获得焦点时可正常覆盖在本程序上方
+                for i in 0..count {
+                    let win: id = msg_send![windows, objectAtIndex: i];
+                    if is_gpui_main_window(win) {
+                        let _: () = msg_send![win, setLevel: 0_i64];
+                    }
+                }
             }
             let _ = NO;
+        }
+    }
+
+    pub fn restore_normal_level() {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, windows];
+            let count: usize = msg_send![windows, count];
+            for i in 0..count {
+                let win: id = msg_send![windows, objectAtIndex: i];
+                if !is_gpui_main_window(win) {
+                    continue;
+                }
+                let _: () = msg_send![win, setLevel: 0_i64];
+            }
         }
     }
 }
@@ -858,8 +927,6 @@ mod macos_tray {
 mod windows_tray {
     use std::mem::size_of;
     use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::OnceLock;
-    use std::thread::ThreadId;
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -868,13 +935,13 @@ mod windows_tray {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DispatchMessageW, FindWindowExW, GWL_EXSTYLE, GetCursorPos,
+        DispatchMessageW, FindWindowExW, GWL_EXSTYLE, GWLP_HWNDPARENT, GetCursorPos,
         GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
         IsIconic, IsWindow, IsWindowVisible, IsZoomed, MF_SEPARATOR,
         MF_STRING, MSG, RegisterClassW, SW_HIDE, SW_MAXIMIZE, SW_NORMAL, SW_RESTORE, SW_SHOW,
-        SetForegroundWindow, SetWindowLongPtrW, ShowWindow, ShowWindowAsync, TPM_NONOTIFY, TPM_RETURNCMD,
+        SetForegroundWindow, SetWindowLongPtrW, ShowWindowAsync, TPM_NONOTIFY, TPM_RETURNCMD,
         TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_POPUP,
     };
     use windows::core::PCWSTR;
 
@@ -887,11 +954,7 @@ mod windows_tray {
     const IDM_QUIT_APP: usize = 1002;
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
     static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
-    static TRAY_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
-
-    fn is_on_main_window_thread() -> bool {
-        TRAY_THREAD_ID.get() != Some(&std::thread::current().id())
-    }
+    static HIDDEN_OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
 
     /// 精确按 GPUI 注册的窗口类名 `Zed::Window` 与标题 `AgentGate` 查找主窗口，绝不误匹配系统内置 `Default IME` 窗口
     unsafe fn find_process_main_window() -> Option<HWND> {
@@ -927,10 +990,14 @@ mod windows_tray {
             if win_pid == current_pid {
                 let raw = found.0 as isize;
                 MAIN_HWND.store(raw, Ordering::SeqCst);
-                // 移除任务栏图标（配合 appears_transparent: true 无外层原生标题栏）
+                // 使用同线程隐藏 Owner 窗口移除任务栏图标，避免 WS_EX_TOOLWINDOW 导致最大化遮挡任务栏
                 let ex = unsafe { GetWindowLongPtrW(found, GWL_EXSTYLE) };
-                let new_ex = (ex & !(WS_EX_APPWINDOW.0 as isize)) | (WS_EX_TOOLWINDOW.0 as isize);
+                let new_ex = ex & !(WS_EX_APPWINDOW.0 as isize) & !(WS_EX_TOOLWINDOW.0 as isize);
                 let _ = unsafe { SetWindowLongPtrW(found, GWL_EXSTYLE, new_ex) };
+                let owner_raw = HIDDEN_OWNER_HWND.load(Ordering::SeqCst);
+                if owner_raw != 0 {
+                    let _ = unsafe { SetWindowLongPtrW(found, GWLP_HWNDPARENT, owner_raw) };
+                }
                 return Some(found);
             }
         }
@@ -1009,8 +1076,30 @@ mod windows_tray {
     }
 
     pub fn install() {
+        // 在主线程创建 0x0 隐藏 Owner 窗口，用于无副作用隐藏主窗口的任务栏图标
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap_or_default();
+            let static_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let empty_title: Vec<u16> = "\0".encode_utf16().collect();
+            if let Ok(owner) = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                PCWSTR(static_class.as_ptr()),
+                PCWSTR(empty_title.as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            ) {
+                HIDDEN_OWNER_HWND.store(owner.0 as isize, Ordering::SeqCst);
+            }
+        }
+
         std::thread::spawn(|| unsafe {
-            let _ = TRAY_THREAD_ID.set(std::thread::current().id());
             let instance = GetModuleHandleW(None).unwrap_or_default();
             let class_name: Vec<u16> = "AgentGateTrayHostClass\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -1085,22 +1174,14 @@ mod windows_tray {
     pub fn set_visible(visible: bool) {
         unsafe {
             if let Some(hwnd) = find_process_main_window() {
-                let same_thread = is_on_main_window_thread();
+                // 统一使用 ShowWindowAsync 异步投递，避免在 GPUI on_input 回调持有 Window 借用期间同步触发 WM_SIZE 导致重入借用失败
                 if visible {
                     if IsIconic(hwnd).as_bool() {
-                        if same_thread {
-                            let _ = ShowWindow(hwnd, SW_RESTORE);
-                        } else {
-                            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
-                        }
-                    } else if same_thread {
-                        let _ = ShowWindow(hwnd, SW_SHOW);
+                        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
                     } else {
                         let _ = ShowWindowAsync(hwnd, SW_SHOW);
                     }
                     let _ = SetForegroundWindow(hwnd);
-                } else if same_thread {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
                 } else {
                     let _ = ShowWindowAsync(hwnd, SW_HIDE);
                 }
@@ -1111,15 +1192,8 @@ mod windows_tray {
     pub fn toggle_maximize() {
         unsafe {
             if let Some(hwnd) = find_process_main_window() {
-                let same_thread = is_on_main_window_thread();
                 if IsZoomed(hwnd).as_bool() {
-                    if same_thread {
-                        let _ = ShowWindow(hwnd, SW_NORMAL);
-                    } else {
-                        let _ = ShowWindowAsync(hwnd, SW_NORMAL);
-                    }
-                } else if same_thread {
-                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                    let _ = ShowWindowAsync(hwnd, SW_NORMAL);
                 } else {
                     let _ = ShowWindowAsync(hwnd, SW_MAXIMIZE);
                 }
