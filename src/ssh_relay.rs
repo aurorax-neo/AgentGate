@@ -793,9 +793,7 @@ impl server::Handler for LocalSshHandler {
         let matched = {
             let guard = self.live_creds.read().ok();
             if let Some(creds) = guard {
-                if creds.mode != AgentAuthMode::EphemeralPassword {
-                    false
-                } else if let Some(expected) = &creds.temp_password {
+                if let Some(expected) = &creds.temp_password {
                     expected
                         .trim()
                         .as_bytes()
@@ -812,14 +810,14 @@ impl server::Handler for LocalSshHandler {
         if matched {
             self.emit_log(
                 "Agent 密码认证通过",
-                format!("本地用户 `{}` 自 {} 通过临时密码验证", user, self.peer_addr),
+                format!("本地用户 `{}` 自 {} 通过本地密码验证", user, self.peer_addr),
                 false,
             );
             Ok(Auth::Accept)
         } else {
             self.emit_log(
                 "Agent 密码认证拒绝",
-                format!("本地用户 `{}` 临时密码不匹配或模式未开启", user),
+                format!("本地用户 `{}` 本地密码不匹配", user),
                 true,
             );
             Ok(Auth::reject())
@@ -832,16 +830,22 @@ impl server::Handler for LocalSshHandler {
         _submethods: &str,
         response: Option<KbdResponse<'a>>,
     ) -> Result<Auth, Self::Error> {
+        let fallback_methods = || Auth::Reject {
+            proceed_with_methods: Some(MethodSet::from(
+                &[MethodKind::Password, MethodKind::PublicKey][..],
+            )),
+            partial_success: false,
+        };
         if !self.is_valid_agent_user(user) {
-            return Ok(Auth::reject());
+            return Ok(fallback_methods());
         }
-        let is_pwd_mode = self
+        let has_pwd = self
             .live_creds
             .read()
             .ok()
-            .is_some_and(|c| c.mode == AgentAuthMode::EphemeralPassword);
-        if !is_pwd_mode {
-            return Ok(Auth::reject());
+            .is_some_and(|c| c.temp_password.as_ref().is_some_and(|p| !p.trim().is_empty()));
+        if !has_pwd {
+            return Ok(fallback_methods());
         }
         match response {
             None => Ok(Auth::Partial {
@@ -855,6 +859,9 @@ impl server::Handler for LocalSshHandler {
                     .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(str::to_string))
                     .unwrap_or_default()
                     ;
+                if entered.trim().is_empty() {
+                    return Ok(fallback_methods());
+                }
                 self.auth_password(user, &entered).await
             }
         }
@@ -871,11 +878,10 @@ impl server::Handler for LocalSshHandler {
         let matched = {
             let guard = self.live_creds.read().ok();
             if let Some(creds) = guard {
-                creds.mode == AgentAuthMode::DedicatedKey
-                    && creds
-                        .dedicated_pubkey
-                        .as_ref()
-                        .is_some_and(|expected| expected == offer.public_key)
+                creds
+                    .dedicated_pubkey
+                    .as_ref()
+                    .is_some_and(|expected| expected == offer.public_key)
             } else {
                 false
             }
@@ -898,11 +904,10 @@ impl server::Handler for LocalSshHandler {
         let matched = {
             let guard = self.live_creds.read().ok();
             if let Some(creds) = guard {
-                creds.mode == AgentAuthMode::DedicatedKey
-                    && creds
-                        .dedicated_pubkey
-                        .as_ref()
-                        .is_some_and(|expected| expected == key.public_key)
+                creds
+                    .dedicated_pubkey
+                    .as_ref()
+                    .is_some_and(|expected| expected == key.public_key)
             } else {
                 false
             }

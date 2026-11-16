@@ -37,14 +37,18 @@ pub fn render_agent_snippet_with_null_dev(
     match format {
         CopyFormat::AgentPromptCard => match host.agent_auth_mode {
             AgentAuthMode::EphemeralPassword => {
-                let temp_pwd = runtime
-                    .current_temp_password
-                    .as_deref()
+                let temp_pwd = {
+                    let p = host.agent_password.trim();
+                    (!p.is_empty()).then_some(p)
+                }
                     .or({
-                        let p = host.agent_password.trim();
-                        (!p.is_empty()).then_some(p)
+                        runtime
+                            .current_temp_password
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                     })
-                    .ok_or_else(|| anyhow!("当前未生成临时密码，请先轮换或重启该条中转"))?;
+                    .ok_or_else(|| anyhow!("当前未配置本地密码，请先重置或编辑该条中转"))?;
                 Ok(format!(
                     "[SSH 目标代号: {codename}]\n\
                      Host: {bind_host}\n\

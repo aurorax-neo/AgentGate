@@ -102,7 +102,7 @@ pub struct RelayHost {
     #[serde(default)]
     pub local_port: u16,
     /// 暴露给 Agent 的本地固定密码（新建时生成并持久化，除手动修改或点击轮换外保持不变）
-    #[serde(default = "RelayHost::generate_ephemeral_password")]
+    #[serde(default)]
     pub agent_password: String,
     /// 真实远端主机地址（IP 或域名，不进 Agent）
     pub real_host: String,
@@ -414,7 +414,7 @@ impl PendingAction {
             Self::SaveHost { is_new: true, .. } => "确认新建 SSH 中转主机",
             Self::SaveHost { is_new: false, .. } => "确认保存主机与代理配置修改",
             Self::DeleteHost { .. } => "确认删除 SSH 中转主机",
-            Self::RotateCredentials { .. } => "确认轮换本地 Agent 专用凭证",
+            Self::RotateCredentials { .. } => "确认重置本地 Agent 专用凭证",
             Self::ToggleAgentAuthMode { .. } => "确认切换 Agent 认证方式",
             Self::CopyAgentConfig { .. } => "确认复制本地中转配置发给 Agent",
         }
@@ -469,7 +469,7 @@ impl PendingAction {
             ),
             Self::RotateCredentials { codename, mode, .. } => match mode {
                 AgentAuthMode::EphemeralPassword => format!(
-                    "将为代号 [{}] 重新生成 24 位高熵临时密码，旧临时密码将立即失效。",
+                    "将为代号 [{}] 重新生成 24 位本地固定密码，旧密码将立即失效。",
                     codename
                 ),
                 AgentAuthMode::DedicatedKey => format!(

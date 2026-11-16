@@ -153,8 +153,8 @@ impl Focusable for AgentGateWorkbench {
 
 impl AgentGateWorkbench {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let storage = EncryptedStorage::new_default()
-            .expect("初始化 AgentGate 本地加密仓库目录失败");
+        let storage =
+            EncryptedStorage::new_default().expect("初始化 AgentGate 本地加密仓库目录失败");
         let prefs = Self::load_ui_prefs(&storage);
         let mut hosts = storage.load_hosts().unwrap_or_default();
         let mut runtimes = HashMap::new();
@@ -225,12 +225,16 @@ impl AgentGateWorkbench {
         let form_label = cx.new(|cx| TextField::new(cx, "本机可见备注（不发给 Agent）", false));
         let form_local_host = cx.new(|cx| TextField::new(cx, "127.0.0.1", false));
         let form_local_port = cx.new(|cx| TextField::new(cx, "本机固定端口 (1~65535)", false));
-        let form_agent_password = cx.new(|cx| TextField::new(cx, "暴露给 Agent 的本地连接密码", true));
-        let form_real_host = cx.new(|cx| TextField::new(cx, "真实远端 IP 或域名（仅存本机）", false));
+        let form_agent_password =
+            cx.new(|cx| TextField::new(cx, "暴露给 Agent 的本地连接密码", true));
+        let form_real_host =
+            cx.new(|cx| TextField::new(cx, "真实远端 IP 或域名（仅存本机）", false));
         let form_real_port = cx.new(|cx| TextField::new(cx, "22", false));
         let form_real_user = cx.new(|cx| TextField::new(cx, "root / ubuntu", false));
-        let form_real_secret = cx.new(|cx| TextField::new(cx, "真实登录密码或 OpenSSH 私钥 PEM", true));
-        let form_real_passphrase = cx.new(|cx| TextField::new(cx, "私钥口令（无口令可留空）", true));
+        let form_real_secret =
+            cx.new(|cx| TextField::new(cx, "真实登录密码或 OpenSSH 私钥 PEM", true));
+        let form_real_passphrase =
+            cx.new(|cx| TextField::new(cx, "私钥口令（无口令可留空）", true));
         let form_proxy_host = cx.new(|cx| TextField::new(cx, "127.0.0.1", false));
         let form_proxy_port = cx.new(|cx| TextField::new(cx, "7890", false));
         let form_proxy_user = cx.new(|cx| TextField::new(cx, "代理用户名（可选）", false));
@@ -314,7 +318,7 @@ impl AgentGateWorkbench {
                 if batch.is_empty() && tray_cmds.is_empty() {
                     continue;
                 }
-                let Ok( updated ) = weak_this.update(cx, |this, cx| {
+                let Ok(updated) = weak_this.update(cx, |this, cx| {
                     for cmd in tray_cmds {
                         match cmd {
                             TrayCommand::ToggleWindow => {
@@ -538,7 +542,11 @@ impl AgentGateWorkbench {
                 rt.push_log(
                     &h.codename,
                     "初始化就绪",
-                    format!("代理: {} | 暴露模式: {}", h.proxy.badge_text(), h.agent_auth_mode.label()),
+                    format!(
+                        "代理: {} | 暴露模式: {}",
+                        h.proxy.badge_text(),
+                        h.agent_auth_mode.label()
+                    ),
                     false,
                 );
                 self.runtimes.insert(h.id, rt);
@@ -560,8 +568,8 @@ impl AgentGateWorkbench {
                 rt.total_connections = 3;
                 rt.push_log(
                     &h1.codename,
-                    "Agent 临时密码认证通过",
-                    "本地用户 `cobalt-nexus-01` 自 127.0.0.1:59412 通过恒定时间临时密码验证",
+                    "Agent 密码认证通过",
+                    "本地用户 `cobalt-nexus-01` 自 127.0.0.1:59412 通过恒定时间本地密码验证",
                     false,
                 );
                 rt.push_log(
@@ -649,7 +657,10 @@ impl AgentGateWorkbench {
                     active_sessions: 0,
                 };
                 self.status_banner = Some((
-                    format!("代号 [{}] 已启动本地 SSH 中转：127.0.0.1:{}", codename, local_port),
+                    format!(
+                        "代号 [{}] 已启动本地 SSH 中转：127.0.0.1:{}",
+                        codename, local_port
+                    ),
                     false,
                 ));
             }
@@ -735,7 +746,8 @@ impl AgentGateWorkbench {
         let default_bind = RelayHost::default_local_bind_host();
         let free_port = RelayHost::allocate_free_local_port(&default_bind);
         let init_pwd = RelayHost::generate_ephemeral_password();
-        self.form_codename.update(cx, |f, cx| f.set_text(next_codename, cx));
+        self.form_codename
+            .update(cx, |f, cx| f.set_text(next_codename, cx));
         self.form_label.update(cx, |f, cx| f.set_text("", cx));
         self.form_local_host
             .update(cx, |f, cx| f.set_text(default_bind, cx));
@@ -745,16 +757,20 @@ impl AgentGateWorkbench {
             .update(cx, |f, cx| f.set_text(init_pwd, cx));
         self.form_real_host.update(cx, |f, cx| f.set_text("", cx));
         self.form_real_port.update(cx, |f, cx| f.set_text("22", cx));
-        self.form_real_user.update(cx, |f, cx| f.set_text("root", cx));
+        self.form_real_user
+            .update(cx, |f, cx| f.set_text("root", cx));
         self.form_real_auth_kind = FormRealAuthKind::Password;
         self.form_real_secret.update(cx, |f, cx| {
             f.set_masked(true, cx);
             f.set_text("", cx);
         });
-        self.form_real_passphrase.update(cx, |f, cx| f.set_text("", cx));
+        self.form_real_passphrase
+            .update(cx, |f, cx| f.set_text("", cx));
         self.form_proxy_kind = FormProxyKind::None;
-        self.form_proxy_host.update(cx, |f, cx| f.set_text("127.0.0.1", cx));
-        self.form_proxy_port.update(cx, |f, cx| f.set_text("7890", cx));
+        self.form_proxy_host
+            .update(cx, |f, cx| f.set_text("127.0.0.1", cx));
+        self.form_proxy_port
+            .update(cx, |f, cx| f.set_text("7890", cx));
         self.form_proxy_user.update(cx, |f, cx| f.set_text("", cx));
         self.form_proxy_pass.update(cx, |f, cx| f.set_text("", cx));
         self.form_agent_auth_mode = AgentAuthMode::EphemeralPassword;
@@ -875,7 +891,9 @@ impl AgentGateWorkbench {
             return Err("机器代号仅允许包含字母、数字、连字符(-)或下划线(_)".to_string());
         }
         if codename.eq_ignore_ascii_case("agent") {
-            return Err("不允许使用通用保留名 `agent` 作为代号，请使用可区分的唯一代号".to_string());
+            return Err(
+                "不允许使用通用保留名 `agent` 作为代号，请使用可区分的唯一代号".to_string(),
+            );
         }
         let is_new = self.editing_host_id.is_none();
         let id = self.editing_host_id.unwrap_or_else(Uuid::new_v4);
@@ -884,7 +902,10 @@ impl AgentGateWorkbench {
             .iter()
             .any(|h| h.id != id && h.codename.eq_ignore_ascii_case(&codename))
         {
-            return Err(format!("代号 [{}] 已存在，请使用唯一代号以便 AI 区分", codename));
+            return Err(format!(
+                "代号 [{}] 已存在，请使用唯一代号以便 AI 区分",
+                codename
+            ));
         }
 
         let raw_bind_host = self.form_local_host.read(cx).text().trim().to_string();
@@ -901,11 +922,9 @@ impl AgentGateWorkbench {
             .ok()
             .filter(|p| *p > 0)
             .ok_or_else(|| "本机监听端口必须是 1~65535 之间的整数".to_string())?;
-        if self
-            .hosts
-            .iter()
-            .any(|h| h.id != id && h.local_bind_host == local_bind_host && h.local_port == local_port)
-        {
+        if self.hosts.iter().any(|h| {
+            h.id != id && h.local_bind_host == local_bind_host && h.local_port == local_port
+        }) {
             return Err(format!(
                 "本机监听地址 {}:{} 已被其它机器条目占用，请更换端口",
                 local_bind_host, local_port
@@ -1030,12 +1049,14 @@ impl AgentGateWorkbench {
             .as_deref()
             .and_then(|pem| PrivateKey::from_openssh(pem).ok())
             .map(|k| k.public_key().clone());
+        let pwd = if !host.agent_password.trim().is_empty() {
+            Some(host.agent_password.clone())
+        } else {
+            rt.current_temp_password.clone()
+        };
         LiveCredentials {
             mode: host.agent_auth_mode,
-            temp_password: rt
-                .current_temp_password
-                .clone()
-                .or_else(|| Some(host.agent_password.clone())),
+            temp_password: pwd,
             dedicated_pubkey,
         }
     }
@@ -1106,12 +1127,7 @@ impl AgentGateWorkbench {
     }
 
     /// 异步测试上游真实 SSH 主机连通性、代理握手与身份认证（支持在主界面与新建/编辑弹窗中直接调用）
-    fn spawn_test_upstream(
-        &mut self,
-        host: RelayHost,
-        from_modal: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn spawn_test_upstream(&mut self, host: RelayHost, from_modal: bool, cx: &mut Context<Self>) {
         let id = host.id;
         let codename = host.codename.clone();
         self.testing_host_ids.insert(id);
@@ -1169,8 +1185,7 @@ impl AgentGateWorkbench {
                                 false,
                             ));
                             if from_modal {
-                                this.form_test_ok =
-                                    Some(format!("上游测试成功：{}", detail));
+                                this.form_test_ok = Some(format!("上游测试成功：{}", detail));
                             }
                         }
                         Err(err) => {
@@ -1240,7 +1255,8 @@ impl AgentGateWorkbench {
                 rt.current_temp_password = Some(host.agent_password.clone());
                 rt.status = RelayStatus::Starting;
                 let live_creds = Self::build_live_credentials(&host, rt);
-                self.status_banner = Some((format!("正在启动代号 [{}] 本地监听...", codename), false));
+                self.status_banner =
+                    Some((format!("正在启动代号 [{}] 本地监听...", codename), false));
                 self.spawn_start_relay_async(host, live_creds, true, cx);
             }
             PendingAction::StopRelay {
@@ -1256,7 +1272,10 @@ impl AgentGateWorkbench {
                 }
                 self.save_ui_prefs();
                 self.status_banner = Some((
-                    format!("已停止代号 [{}] 在端口 {} 的中转服务（端口与密码保持不变）", codename, local_port),
+                    format!(
+                        "已停止代号 [{}] 在端口 {} 的中转服务（端口与密码保持不变）",
+                        codename, local_port
+                    ),
                     false,
                 ));
             }
@@ -1285,18 +1304,15 @@ impl AgentGateWorkbench {
                     None
                 };
 
-                let (key_path, pubkey) = match self
-                    .storage
-                    .ensure_dedicated_agent_key(&mut host, false)
-                {
-                    Ok(v) => v,
-                    Err(err) => {
-                        self.status_banner =
-                            Some((format!("生成专用密钥失败: {}", err), true));
-                        cx.notify();
-                        return;
-                    }
-                };
+                let (key_path, pubkey) =
+                    match self.storage.ensure_dedicated_agent_key(&mut host, false) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.status_banner = Some((format!("生成专用密钥失败: {}", err), true));
+                            cx.notify();
+                            return;
+                        }
+                    };
 
                 if let Some((prev_name, _, _)) = &prev_snapshot
                     && prev_name != &host.codename
@@ -1313,26 +1329,32 @@ impl AgentGateWorkbench {
                 }
 
                 if let Err(err) = self.storage.save_hosts(&self.hosts) {
-                    self.status_banner =
-                        Some((format!("加密保存仓库失败: {}", err), true));
+                    self.status_banner = Some((format!("加密保存仓库失败: {}", err), true));
                     cx.notify();
                     return;
                 }
 
-                let rt = self.runtimes.entry(id).or_insert_with(|| RelayRuntimeState {
-                    status: RelayStatus::Stopped,
-                    current_temp_password: Some(host.agent_password.clone()),
-                    dedicated_key_path: None,
-                    dedicated_pubkey_openssh: None,
-                    total_connections: 0,
-                    logs: Vec::new(),
-                });
+                let rt = self
+                    .runtimes
+                    .entry(id)
+                    .or_insert_with(|| RelayRuntimeState {
+                        status: RelayStatus::Stopped,
+                        current_temp_password: Some(host.agent_password.clone()),
+                        dedicated_key_path: None,
+                        dedicated_pubkey_openssh: None,
+                        total_connections: 0,
+                        logs: Vec::new(),
+                    });
                 rt.rotate_or_clear_temp_password(Some(host.agent_password.clone()));
                 rt.dedicated_key_path = Some(key_path.to_string_lossy().to_string());
                 rt.dedicated_pubkey_openssh = Some(pubkey);
                 rt.push_log(
                     &codename,
-                    if is_new { "新建主机" } else { "更新主机" },
+                    if is_new {
+                        "新建主机"
+                    } else {
+                        "更新主机"
+                    },
                     format!(
                         "本机监听: {}:{} | 代理: {} | Agent 认证: {}",
                         host.local_bind_host,
@@ -1382,7 +1404,8 @@ impl AgentGateWorkbench {
                     self.selected_host_id = self.hosts.first().map(|h| h.id);
                 }
                 self.save_ui_prefs();
-                self.status_banner = Some((format!("已删除代号 [{}] 及其专用密钥", codename), false));
+                self.status_banner =
+                    Some((format!("已删除代号 [{}] 及其专用密钥", codename), false));
             }
             PendingAction::RotateCredentials { id, codename, mode } => {
                 let Some(host_idx) = self.hosts.iter().position(|h| h.id == id) else {
@@ -1396,7 +1419,12 @@ impl AgentGateWorkbench {
                         let _ = self.storage.save_hosts(&self.hosts);
                         if let Some(rt) = self.runtimes.get_mut(&id) {
                             rt.rotate_or_clear_temp_password(Some(new_pwd));
-                            rt.push_log(&codename, "轮换临时密码", "已生成新 24 位临时密码，旧密码已失效", false);
+                            rt.push_log(
+                                &codename,
+                                "重置本地密码",
+                                "已生成新 24 位本地固定密码，旧密码已失效",
+                                false,
+                            );
                         }
                     }
                     AgentAuthMode::DedicatedKey => {
@@ -1406,9 +1434,15 @@ impl AgentGateWorkbench {
                         {
                             let _ = self.storage.save_hosts(&self.hosts);
                             if let Some(rt) = self.runtimes.get_mut(&id) {
-                                rt.dedicated_key_path = Some(key_path.to_string_lossy().to_string());
+                                rt.dedicated_key_path =
+                                    Some(key_path.to_string_lossy().to_string());
                                 rt.dedicated_pubkey_openssh = Some(pubkey);
-                                rt.push_log(&codename, "重置专用密钥", "已重新生成本机 Ed25519 密钥对", false);
+                                rt.push_log(
+                                    &codename,
+                                    "重置专用密钥",
+                                    "已重新生成本机 Ed25519 密钥对",
+                                    false,
+                                );
                             }
                         }
                     }
@@ -1418,7 +1452,11 @@ impl AgentGateWorkbench {
                     ctrl.update_credentials(Self::build_live_credentials(host, rt));
                 }
                 self.status_banner = Some((
-                    format!("代号 [{}] 的「{}」已完成轮换并实时生效", codename, mode.label()),
+                    format!(
+                        "代号 [{}] 的「{}」已完成重置并实时生效",
+                        codename,
+                        mode.label()
+                    ),
                     false,
                 ));
             }
@@ -1472,7 +1510,11 @@ impl AgentGateWorkbench {
                             false,
                         );
                         self.status_banner = Some((
-                            format!("已复制代号 [{}] 的「{}」到剪贴板，可直接粘贴发给 Agent", codename, format.label()),
+                            format!(
+                                "已复制代号 [{}] 的「{}」到剪贴板，可直接粘贴发给 Agent",
+                                codename,
+                                format.label()
+                            ),
                             false,
                         ));
                     }
@@ -1483,6 +1525,51 @@ impl AgentGateWorkbench {
             }
         }
         cx.notify();
+    }
+
+    fn render_status_strip(&self, theme: WorkbenchTheme) -> impl IntoElement {
+        let (banner_msg, banner_is_err) = self
+            .status_banner
+            .clone()
+            .unwrap_or_else(|| ("就绪".to_string(), false));
+        let dot_color = if banner_is_err {
+            theme.danger
+        } else {
+            theme.success
+        };
+
+        div()
+            .w_full()
+            .px_4()
+            .py_1p5()
+            .bg(theme.bg_surface)
+            .border_b_1()
+            .border_color(theme.border)
+            .flex()
+            .items_start()
+            .gap_2()
+            .child(
+                div()
+                    .mt(px(4.))
+                    .size(px(7.))
+                    .flex_shrink_0()
+                    .rounded(px(3.5))
+                    .bg(dot_color),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .line_clamp(2)
+                    .text_size(px(12.))
+                    .text_color(if banner_is_err {
+                        theme.danger
+                    } else {
+                        theme.text_secondary
+                    })
+                    .child(banner_msg),
+            )
     }
 
     fn render_top_bar(&self, theme: WorkbenchTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1496,16 +1583,6 @@ impl AgentGateWorkbench {
             .values()
             .map(|r| r.status.active_sessions())
             .sum();
-        let (banner_msg, banner_is_err) = self
-            .status_banner
-            .clone()
-            .unwrap_or_else(|| ("就绪".to_string(), false));
-        let dot_color = if banner_is_err {
-            theme.danger
-        } else {
-            theme.success
-        };
-
         div()
             .h(px(50.))
             .w_full()
@@ -1562,74 +1639,46 @@ impl AgentGateWorkbench {
                             .flex()
                             .items_center()
                             .child(format!("活跃会话 {}", active_sessions)),
-                    )
-                    .child(
-                        div()
-                            .pl_2()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(px(12.))
-                            .child(div().size(px(7.)).rounded(px(3.5)).bg(dot_color))
-                            .child(
-                                div()
-                                    .text_color(if banner_is_err {
-                                        theme.danger
-                                    } else {
-                                        theme.text_secondary
-                                    })
-                                    .child(banner_msg),
-                            ),
                     ),
             )
             .child(
                 div()
                     .occlude()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_2()
                     .child(div().w(px(196.)).child(self.search_input.clone()))
                     .child(
-                        action_button(
-                            "btn-new-host",
-                            "+ 新建",
-                            theme,
-                            true,
-                            false,
-                        )
-                        .bg(theme.accent)
-                        .text_color(rgb(0xffffff))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.reset_form_for_new_host(cx);
-                            this.show_host_modal = true;
-                            cx.notify();
-                        })),
+                        action_button("btn-new-host", "+ 新建", theme, true, false)
+                            .bg(theme.accent)
+                            .text_color(rgb(0xffffff))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reset_form_for_new_host(cx);
+                                this.show_host_modal = true;
+                                cx.notify();
+                            })),
                     )
                     .child(
-                        action_button(
-                            "btn-stop-all",
-                            "全停",
-                            theme,
-                            running_count > 0,
-                            true,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if running_count > 0 {
-                                this.request_confirmation(
-                                    PendingAction::StopAllRelays { running_count },
-                                    cx,
-                                );
-                            }
-                        })),
+                        action_button("btn-stop-all", "全停", theme, running_count > 0, true)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if running_count > 0 {
+                                    this.request_confirmation(
+                                        PendingAction::StopAllRelays { running_count },
+                                        cx,
+                                    );
+                                }
+                            })),
                     )
                     .child(
-                        theme_icon_button("btn-theme-toggle", self.is_dark, theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.is_dark = !this.is_dark;
-                            this.sync_inputs_theme(cx);
-                            this.save_ui_prefs();
-                            cx.notify();
-                        })),
+                        theme_icon_button("btn-theme-toggle", self.is_dark, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.is_dark = !this.is_dark;
+                                this.sync_inputs_theme(cx);
+                                this.save_ui_prefs();
+                                cx.notify();
+                            }),
+                        ),
                     )
                     .when(cfg!(not(target_os = "macos")), |bar| {
                         bar.child(
@@ -1639,30 +1688,45 @@ impl AgentGateWorkbench {
                                 .items_center()
                                 .gap_1()
                                 .child(
-                                    window_ctrl_button("win-btn-min", "—", theme, false)
-                                        .on_click(cx.listener(|_, _, window, _| {
+                                    window_ctrl_button("win-btn-min", "—", theme, false).on_click(
+                                        cx.listener(|_, _, window, _| {
                                             platform_set_window_visible(false);
-                                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                            #[cfg(any(
+                                                target_os = "linux",
+                                                target_os = "freebsd"
+                                            ))]
                                             window.minimize_window();
-                                            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                                            #[cfg(not(any(
+                                                target_os = "linux",
+                                                target_os = "freebsd"
+                                            )))]
                                             let _ = window;
-                                        })),
+                                        }),
+                                    ),
                                 )
                                 .child(
-                                    window_ctrl_button("win-btn-max", "□", theme, false)
-                                        .on_click(cx.listener(|_, _, window, _| {
+                                    window_ctrl_button("win-btn-max", "□", theme, false).on_click(
+                                        cx.listener(|_, _, window, _| {
                                             platform_toggle_maximize_window(window);
-                                        })),
+                                        }),
+                                    ),
                                 )
                                 .child(
-                                    window_ctrl_button("win-btn-close", "×", theme, true)
-                                        .on_click(cx.listener(|_, _, window, _| {
+                                    window_ctrl_button("win-btn-close", "×", theme, true).on_click(
+                                        cx.listener(|_, _, window, _| {
                                             platform_set_window_visible(false);
-                                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                            #[cfg(any(
+                                                target_os = "linux",
+                                                target_os = "freebsd"
+                                            ))]
                                             window.minimize_window();
-                                            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                                            #[cfg(not(any(
+                                                target_os = "linux",
+                                                target_os = "freebsd"
+                                            )))]
                                             let _ = window;
-                                        })),
+                                        }),
+                                    ),
                                 ),
                         )
                     }),
@@ -1795,11 +1859,14 @@ impl AgentGateWorkbench {
                                     .justify_between()
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w_0()
                                             .flex()
                                             .items_center()
                                             .gap_1p5()
                                             .child(
                                                 div()
+                                                    .flex_shrink_0()
                                                     .size(px(7.))
                                                     .rounded(px(3.5))
                                                     .bg(if is_running {
@@ -1810,6 +1877,8 @@ impl AgentGateWorkbench {
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_size(px(13.5))
                                                     .font_weight(gpui::FontWeight::BOLD)
                                                     .text_color(if is_selected {
@@ -1822,6 +1891,7 @@ impl AgentGateWorkbench {
                                             .when(is_selected, |el| {
                                                 el.child(
                                                     div()
+                                                        .flex_shrink_0()
                                                         .px_1p5()
                                                         .h(px(17.))
                                                         .rounded(px(3.))
@@ -1836,6 +1906,33 @@ impl AgentGateWorkbench {
                                             }),
                                     )
                                     .child({
+                                        let host_test = host.clone();
+                                        let is_testing = self.testing_host_ids.contains(&id);
+                                        action_button(
+                                            ("row-test", idx),
+                                            if is_testing { "测试中" } else { "测试" },
+                                            theme,
+                                            !is_testing,
+                                            false,
+                                        )
+                                        .h(px(23.))
+                                        .px_2()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.selected_host_id = Some(id);
+                                                if !this.testing_host_ids.contains(&id) {
+                                                    this.spawn_test_upstream(
+                                                        host_test.clone(),
+                                                        false,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                    })
+                                    .child({
                                         let codename_toggle = codename.clone();
                                         let stop_port = rt.status.local_port();
                                         action_button(
@@ -1847,28 +1944,31 @@ impl AgentGateWorkbench {
                                         )
                                         .h(px(23.))
                                         .px_2()
+                                        .flex_shrink_0()
                                         .text_size(px(11.))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.selected_host_id = Some(id);
-                                            if let Some(p) = stop_port {
-                                                this.request_confirmation(
-                                                    PendingAction::StopRelay {
-                                                        id,
-                                                        codename: codename_toggle.clone(),
-                                                        local_port: p,
-                                                    },
-                                                    cx,
-                                                );
-                                            } else {
-                                                this.request_confirmation(
-                                                    PendingAction::StartRelay {
-                                                        id,
-                                                        codename: codename_toggle.clone(),
-                                                    },
-                                                    cx,
-                                                );
-                                            }
-                                        }))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.selected_host_id = Some(id);
+                                                if let Some(p) = stop_port {
+                                                    this.request_confirmation(
+                                                        PendingAction::StopRelay {
+                                                            id,
+                                                            codename: codename_toggle.clone(),
+                                                            local_port: p,
+                                                        },
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.request_confirmation(
+                                                        PendingAction::StartRelay {
+                                                            id,
+                                                            codename: codename_toggle.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
                                     }),
                             )
                             .child(
@@ -1886,29 +1986,22 @@ impl AgentGateWorkbench {
                                             })
                                             .child(format!("{}:{}", bind_host, active_port)),
                                     )
-                                    .child(
-                                        div()
-                                            .text_color(theme.text_muted)
-                                            .child(format!(
-                                                "{} · {}",
-                                                host.proxy.badge_text(),
-                                                match host.agent_auth_mode {
-                                                    AgentAuthMode::EphemeralPassword => "密码",
-                                                    AgentAuthMode::DedicatedKey => "密钥",
-                                                }
-                                            )),
-                                    ),
+                                    .child(div().text_color(theme.text_muted).child(format!(
+                                        "{} · {}",
+                                        host.proxy.badge_text(),
+                                        match host.agent_auth_mode {
+                                            AgentAuthMode::EphemeralPassword => "密码",
+                                            AgentAuthMode::DedicatedKey => "密钥",
+                                        }
+                                    ))),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme.text_muted)
-                                    .child(if host.label.is_empty() {
-                                        host.masked_real_endpoint()
-                                    } else {
-                                        host.label.clone()
-                                    }),
-                            )
+                            .child(div().text_size(px(11.)).text_color(theme.text_muted).child(
+                                if host.label.is_empty() {
+                                    host.masked_real_endpoint()
+                                } else {
+                                    host.label.clone()
+                                },
+                            ))
                     })),
             )
     }
@@ -1941,11 +2034,7 @@ impl AgentGateWorkbench {
                 .child("未找到选中的主机条目")
                 .into_any_element();
         };
-        let rt = self
-            .runtimes
-            .get(&selected_id)
-            .cloned()
-            .unwrap_or_default();
+        let rt = self.runtimes.get(&selected_id).cloned().unwrap_or_default();
         let is_running = rt.status.is_running();
         let running_port = rt.status.local_port();
         let display_port = running_port.unwrap_or(host.local_port);
@@ -1963,9 +2052,8 @@ impl AgentGateWorkbench {
                 active_sessions: 0,
             };
         }
-        let snippet_preview =
-            render_agent_snippet(&host, &preview_rt, CopyFormat::AgentPromptCard)
-                .unwrap_or_else(|e| e.to_string());
+        let snippet_preview = render_agent_snippet(&host, &preview_rt, CopyFormat::AgentPromptCard)
+            .unwrap_or_else(|e| e.to_string());
 
         div()
             .flex_1()
@@ -2379,10 +2467,7 @@ impl AgentGateWorkbench {
                                                 let mode = host.agent_auth_mode;
                                                 action_button(
                                                     "btn-rotate-cred",
-                                                    match mode {
-                                                        AgentAuthMode::EphemeralPassword => "轮换",
-                                                        AgentAuthMode::DedicatedKey => "重置",
-                                                    },
+                                                    "重置",
                                                     theme,
                                                     true,
                                                     false,
@@ -2571,15 +2656,23 @@ impl AgentGateWorkbench {
             .into_any_element()
     }
 
-    fn render_host_modal(
-        &self,
-        theme: WorkbenchTheme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_host_modal(&self, theme: WorkbenchTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let is_editing = self.editing_host_id.is_some();
         let secret_masked = self.form_real_secret.read(cx).is_masked();
         let agent_pwd_masked = self.form_agent_password.read(cx).is_masked();
         let proxy_pwd_masked = self.form_proxy_pass.read(cx).is_masked();
+        let form_feedback_is_err = self.form_error.is_some();
+        let form_feedback = self
+            .form_error
+            .clone()
+            .or_else(|| self.form_test_ok.clone())
+            .or_else(|| {
+                if self.form_testing {
+                    Some("正在连接上游服务器验证代理与凭据...".to_string())
+                } else {
+                    None
+                }
+            });
 
         div()
             .id("host-editor-modal-backdrop")
@@ -2596,6 +2689,9 @@ impl AgentGateWorkbench {
             .child(
                 div()
                     .w(px(660.))
+                    .h(gpui::relative(0.92))
+                    .max_h(gpui::relative(0.92))
+                    .overflow_hidden()
                     .p_5()
                     .rounded(px(8.))
                     .bg(theme.bg_surface)
@@ -2604,7 +2700,7 @@ impl AgentGateWorkbench {
                     .shadow_lg()
                     .flex()
                     .flex_col()
-                    .gap_3p5()
+                    .gap_3()
                     .child(
                         div()
                             .flex()
@@ -2635,6 +2731,16 @@ impl AgentGateWorkbench {
                                     })),
                             ),
                     )
+                    .child(
+                        div()
+                            .id("host-editor-form-scroll")
+                            .w_full()
+                            .min_h_0()
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_3p5()
                     // 第一行：代号与备注
                     .child(
                         div()
@@ -3189,44 +3295,73 @@ impl AgentGateWorkbench {
                                     ),
                             ),
                     )
+                    )
                     // 底部栏：校验反馈 + 取消与保存按钮
                     .child(
                         div()
+                            .flex_shrink_0()
                             .pt_2p5()
                             .border_t_1()
                             .border_color(theme.border)
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(12.))
-                                    .text_color(if self.form_error.is_some() {
-                                        theme.danger
-                                    } else if self.form_test_ok.is_some() {
-                                        theme.success
-                                    } else {
-                                        theme.accent_hover
-                                    })
-                                    .child(
-                                        self.form_error
-                                            .clone()
-                                            .or_else(|| self.form_test_ok.clone())
-                                            .unwrap_or_else(|| {
-                                                if self.form_testing {
-                                                    "正在连接上游服务器验证代理与凭据...".to_string()
+                            .flex_col()
+                            .gap_2()
+                            .when(form_feedback.is_some(), |footer| {
+                                let message = form_feedback.clone().unwrap_or_default();
+                                let copy_message = message.clone();
+                                footer.child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .items_start()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("form-test-feedback")
+                                                .flex_1()
+                                                .min_w_0()
+                                                .max_h(px(84.))
+                                                .overflow_y_scroll()
+                                                .whitespace_normal()
+                                                .text_size(px(12.))
+                                                .text_color(if form_feedback_is_err {
+                                                    theme.danger
+                                                } else if self.form_test_ok.is_some() {
+                                                    theme.success
                                                 } else {
-                                                    String::new()
-                                                }
-                                            }),
-                                    ),
-                            )
+                                                    theme.accent_hover
+                                                })
+                                                .child(message),
+                                        )
+                                        .child(
+                                            action_button(
+                                                "form-copy-feedback",
+                                                "复制",
+                                                theme,
+                                                !copy_message.is_empty(),
+                                                false,
+                                            )
+                                            .h(px(26.))
+                                            .px_2()
+                                            .flex_shrink_0()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy_message.clone(),
+                                                ));
+                                                this.status_banner =
+                                                    Some(("已复制测试结果".to_string(), false));
+                                                cx.notify();
+                                            })),
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
+                                    .w_full()
                                     .flex()
+                                    .flex_shrink_0()
                                     .items_center()
+                                    .justify_end()
                                     .gap_2()
                                     .child(
                                         action_button(
@@ -3643,13 +3778,15 @@ impl AgentGateWorkbench {
                                     theme.accent
                                 })
                                 .text_color(rgb(0xffffff))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pending_confirm = None;
-                                    this.execute_confirmed_action(
-                                        confirm_action_clone.clone(),
-                                        cx,
-                                    );
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.pending_confirm = None;
+                                        this.execute_confirmed_action(
+                                            confirm_action_clone.clone(),
+                                            cx,
+                                        );
+                                    },
+                                )),
                             ),
                     ),
             )
@@ -3688,6 +3825,7 @@ impl Render for AgentGateWorkbench {
             .bg(theme.bg_app)
             .text_color(theme.text_primary)
             .child(self.render_top_bar(theme, cx))
+            .child(self.render_status_strip(theme))
             .child(
                 div()
                     .id("agentgate-workspace-body")
@@ -3745,12 +3883,7 @@ fn theme_icon_button(
             div()
                 .size(px(14.))
                 .relative()
-                .child(
-                    div()
-                        .size(px(14.))
-                        .rounded(px(7.))
-                        .bg(theme.text_primary),
-                )
+                .child(div().size(px(14.)).rounded(px(7.)).bg(theme.text_primary))
                 .child(
                     div()
                         .absolute()

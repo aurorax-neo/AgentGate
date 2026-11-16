@@ -4,8 +4,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    div, fill, point, prelude::*, px, relative, rgba, size,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -395,9 +395,7 @@ impl EntityInputHandler for TextField {
         let start = self.clamp_to_char_boundary(range.start);
         let end = self.clamp_to_char_boundary(range.end).max(start);
 
-        self.content =
-            (self.content[0..start].to_owned() + new_text + &self.content[end..])
-                .into();
+        self.content = (self.content[0..start].to_owned() + new_text + &self.content[end..]).into();
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.marked_range.take();
         cx.notify();
@@ -419,9 +417,7 @@ impl EntityInputHandler for TextField {
         let start = self.clamp_to_char_boundary(range.start);
         let end = self.clamp_to_char_boundary(range.end).max(start);
 
-        self.content =
-            (self.content[0..start].to_owned() + new_text + &self.content[end..])
-                .into();
+        self.content = (self.content[0..start].to_owned() + new_text + &self.content[end..]).into();
         if !new_text.is_empty() {
             self.marked_range = Some(start..start + new_text.len());
         } else {
