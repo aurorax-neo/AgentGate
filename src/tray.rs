@@ -835,7 +835,7 @@ mod macos_tray {
         if std::env::var("AGENTGATE_DEBUG_TRAY").as_deref() != Ok("1") {
             return;
         }
-        if LOGGED_FRAME.swap(true, Ordering::SeqCst) {
+        if LOGGED_FRAME.load(Ordering::SeqCst) {
             return;
         }
         let ptr = STATUS_BUTTON_PTR.load(Ordering::SeqCst);
@@ -847,10 +847,12 @@ mod macos_tray {
             let btn_win: id = msg_send![button, window];
             if btn_win != nil {
                 let frame: cocoa::foundation::NSRect = msg_send![btn_win, frame];
-                println!(
-                    "TRAY_BAR_FRAME X={} Y={} W={} H={}",
-                    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
-                );
+                if frame.size.height > 0.0 && !LOGGED_FRAME.swap(true, Ordering::SeqCst) {
+                    println!(
+                        "TRAY_BAR_FRAME X={} Y={} W={} H={}",
+                        frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+                    );
+                }
             }
         }
     }

@@ -21,8 +21,8 @@ use crate::models::{
 };
 use crate::prompt_tpl::render_agent_snippet;
 use crate::ssh_relay::{
-    LiveCredentials, RelayEvent, RunningRelayControl, global_tokio_runtime, start_host_relay,
-    test_upstream_connection,
+    LiveCredentials, RelayEvent, RunningRelayControl, global_tokio_runtime,
+    start_host_relay_with_id, test_upstream_connection,
 };
 use crate::storage::EncryptedStorage;
 use crate::tray::{
@@ -107,6 +107,7 @@ pub struct AgentGateWorkbench {
     hosts: Vec<RelayHost>,
     runtimes: HashMap<Uuid, RelayRuntimeState>,
     controls: HashMap<Uuid, RunningRelayControl>,
+    desired_relay_instance: HashMap<Uuid, Uuid>,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
 
     is_dark: bool,
@@ -117,6 +118,8 @@ pub struct AgentGateWorkbench {
     form_error: Option<String>,
     form_test_ok: Option<String>,
     form_testing: bool,
+    form_session_seq: u64,
+    form_verified_host_key: Option<(String, u16, String)>,
     testing_host_ids: HashSet<Uuid>,
     pending_confirm: Option<PendingAction>,
     status_banner: Option<(String, bool)>,
@@ -152,7 +155,7 @@ impl Focusable for AgentGateWorkbench {
 }
 
 impl AgentGateWorkbench {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let storage =
             EncryptedStorage::new_default().expect("初始化 AgentGate 本地加密仓库目录失败");
         let prefs = Self::load_ui_prefs(&storage);
@@ -246,6 +249,7 @@ impl AgentGateWorkbench {
             hosts,
             runtimes,
             controls: HashMap::new(),
+            desired_relay_instance: HashMap::new(),
             event_tx,
             is_dark: prefs.is_dark,
             show_local_pwd: false,
@@ -255,6 +259,8 @@ impl AgentGateWorkbench {
             form_error: None,
             form_test_ok: None,
             form_testing: false,
+            form_session_seq: 0,
+            form_verified_host_key: None,
             testing_host_ids: HashSet::new(),
             pending_confirm: None,
             status_banner: Some(("就绪".to_string(), false)),
@@ -279,25 +285,30 @@ impl AgentGateWorkbench {
             form_agent_auth_mode: AgentAuthMode::EphemeralPassword,
         };
 
+        window.focus(&this.focus_handle);
         this.sync_inputs_theme(cx);
         this.reset_form_for_new_host(cx);
-        this.apply_optional_demo_seed(cx);
+        let demo_seeded = this.apply_optional_demo_seed(cx);
 
-        // 自动恢复上次退出前处于运行中的中转主机（保持固定端口与固定密码不中断）
-        let resume_ids: Vec<Uuid> = prefs
-            .running_host_ids
-            .clone()
-            .unwrap_or_else(|| this.hosts.iter().map(|h| h.id).collect());
-        for resume_id in &resume_ids {
-            if this.controls.contains_key(resume_id) {
-                continue;
-            }
-            if let Some(host) = this.hosts.iter().find(|h| &h.id == resume_id).cloned() {
-                let rt = this.runtimes.entry(host.id).or_default();
-                rt.current_temp_password = Some(host.agent_password.clone());
-                rt.status = RelayStatus::Starting;
-                let live_creds = Self::build_live_credentials(&host, rt);
-                this.spawn_start_relay_async(host, live_creds, false, cx);
+        // 自动恢复上次退出前处于运行中的中转主机（若本次为首次 Demo Seed 则保持其预设运行态，避免重复并发启动）
+        if !demo_seeded {
+            let resume_ids: Vec<Uuid> = prefs
+                .running_host_ids
+                .clone()
+                .unwrap_or_else(|| this.hosts.iter().map(|h| h.id).collect());
+            for resume_id in &resume_ids {
+                if this.controls.contains_key(resume_id)
+                    || this.desired_relay_instance.contains_key(resume_id)
+                {
+                    continue;
+                }
+                if let Some(host) = this.hosts.iter().find(|h| &h.id == resume_id).cloned() {
+                    let rt = this.runtimes.entry(host.id).or_default();
+                    rt.current_temp_password = Some(host.agent_password.clone());
+                    rt.status = RelayStatus::Starting;
+                    let live_creds = Self::build_live_credentials(&host, rt);
+                    this.spawn_start_relay_async(host, live_creds, false, cx);
+                }
             }
         }
 
@@ -380,13 +391,15 @@ impl AgentGateWorkbench {
     }
 
     fn shutdown_all_and_quit(&mut self, cx: &mut Context<Self>) {
+        // 先持久化退出前运行列表，再统一停止本地监听句柄
+        self.save_ui_prefs();
+        self.desired_relay_instance.clear();
         for (_, ctrl) in self.controls.drain() {
             ctrl.stop();
         }
         for rt in self.runtimes.values_mut() {
             rt.rotate_or_clear_temp_password(None);
         }
-        self.save_ui_prefs();
         cx.quit();
         std::process::exit(0);
     }
@@ -441,12 +454,12 @@ impl AgentGateWorkbench {
         }
     }
 
-    fn apply_optional_demo_seed(&mut self, cx: &mut Context<Self>) {
+    fn apply_optional_demo_seed(&mut self, cx: &mut Context<Self>) -> bool {
         if !cfg!(debug_assertions) {
-            return;
+            return false;
         }
         if std::env::var("AGENTGATE_DEMO_SEED").as_deref() != Ok("1") {
-            return;
+            return false;
         }
         if self.hosts.is_empty() {
             let now = RelayHost::now_str();
@@ -618,7 +631,9 @@ impl AgentGateWorkbench {
                     _ => {}
                 }
             }
+            return true;
         }
+        false
     }
 
     fn sync_inputs_theme(&mut self, cx: &mut Context<Self>) {
@@ -648,13 +663,20 @@ impl AgentGateWorkbench {
         match event {
             RelayEvent::Started {
                 host_id,
+                instance_id,
                 codename,
                 local_port,
             } => {
+                if self.desired_relay_instance.get(&host_id).copied() != Some(instance_id)
+                    || !self.hosts.iter().any(|h| h.id == host_id)
+                {
+                    return;
+                }
                 let rt = self.runtimes.entry(host_id).or_default();
+                let prev_sessions = rt.status.active_sessions();
                 rt.status = RelayStatus::Running {
                     local_port,
-                    active_sessions: 0,
+                    active_sessions: prev_sessions,
                 };
                 self.status_banner = Some((
                     format!(
@@ -666,19 +688,19 @@ impl AgentGateWorkbench {
             }
             RelayEvent::Stopped {
                 host_id,
+                instance_id,
                 codename,
-                local_port,
+                local_port: _,
             } => {
-                if self
-                    .controls
-                    .get(&host_id)
-                    .is_some_and(|ctrl| ctrl.local_port != local_port)
-                {
+                if self.desired_relay_instance.get(&host_id).copied() != Some(instance_id) {
                     return;
                 }
-                let rt = self.runtimes.entry(host_id).or_default();
-                rt.status = RelayStatus::Stopped;
+                self.desired_relay_instance.remove(&host_id);
                 self.controls.remove(&host_id);
+                if let Some(rt) = self.runtimes.get_mut(&host_id) {
+                    rt.status = RelayStatus::Stopped;
+                }
+                self.save_ui_prefs();
                 self.status_banner = Some((format!("代号 [{}] 本地监听已停止", codename), false));
             }
             RelayEvent::SessionsChanged {
@@ -686,7 +708,9 @@ impl AgentGateWorkbench {
                 active_sessions,
                 total_connections,
             } => {
-                let rt = self.runtimes.entry(host_id).or_default();
+                let Some(rt) = self.runtimes.get_mut(&host_id) else {
+                    return;
+                };
                 if let RelayStatus::Running { local_port, .. } = rt.status {
                     rt.status = RelayStatus::Running {
                         local_port,
@@ -712,29 +736,39 @@ impl AgentGateWorkbench {
                 detail,
                 is_error,
             } => {
-                let rt = self.runtimes.entry(host_id).or_default();
-                rt.push_log(&codename, event, detail, is_error);
+                if let Some(rt) = self.runtimes.get_mut(&host_id) {
+                    rt.push_log(&codename, event, detail, is_error);
+                }
             }
             RelayEvent::Error {
                 host_id,
+                instance_id,
                 codename,
-                local_port,
+                local_port: _,
                 message,
             } => {
-                if self
-                    .controls
-                    .get(&host_id)
-                    .is_some_and(|ctrl| ctrl.local_port != local_port)
-                {
+                if self.desired_relay_instance.get(&host_id).copied() != Some(instance_id) {
                     return;
                 }
-                let rt = self.runtimes.entry(host_id).or_default();
-                rt.status = RelayStatus::Error(message.clone());
-                rt.push_log(&codename, "服务异常", message.clone(), true);
+                self.desired_relay_instance.remove(&host_id);
                 self.controls.remove(&host_id);
+                if let Some(rt) = self.runtimes.get_mut(&host_id) {
+                    rt.status = RelayStatus::Error(message.clone());
+                    rt.push_log(&codename, "服务异常", message.clone(), true);
+                }
+                self.save_ui_prefs();
                 self.status_banner = Some((format!("代号 [{}] 异常: {}", codename, message), true));
             }
         }
+    }
+
+    fn close_host_modal(&mut self) {
+        self.show_host_modal = false;
+        self.form_error = None;
+        self.form_test_ok = None;
+        self.form_testing = false;
+        self.form_verified_host_key = None;
+        self.form_session_seq = self.form_session_seq.wrapping_add(1);
     }
 
     fn reset_form_for_new_host(&mut self, cx: &mut Context<Self>) {
@@ -742,6 +776,8 @@ impl AgentGateWorkbench {
         self.form_error = None;
         self.form_test_ok = None;
         self.form_testing = false;
+        self.form_verified_host_key = None;
+        self.form_session_seq = self.form_session_seq.wrapping_add(1);
         let next_codename = RelayHost::generate_codename(self.hosts.len());
         let default_bind = RelayHost::default_local_bind_host();
         let free_port = RelayHost::allocate_free_local_port(&default_bind);
@@ -781,6 +817,11 @@ impl AgentGateWorkbench {
         self.form_error = None;
         self.form_test_ok = None;
         self.form_testing = false;
+        self.form_verified_host_key = host
+            .pinned_host_key_openssh
+            .clone()
+            .map(|pk| (host.real_host.clone(), host.real_port, pk));
+        self.form_session_seq = self.form_session_seq.wrapping_add(1);
         self.form_codename
             .update(cx, |f, cx| f.set_text(host.codename.clone(), cx));
         self.form_label
@@ -1012,13 +1053,21 @@ impl AgentGateWorkbench {
         };
 
         let existing = self.hosts.iter().find(|h| h.id == id);
-        let pinned_host_key_openssh = existing.and_then(|h| {
-            if h.real_host == real_host && h.real_port == real_port {
-                h.pinned_host_key_openssh.clone()
-            } else {
-                None
-            }
-        });
+        let pinned_host_key_openssh = existing
+            .and_then(|h| {
+                if h.real_host == real_host && h.real_port == real_port {
+                    h.pinned_host_key_openssh.clone()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.form_verified_host_key
+                    .as_ref()
+                    .and_then(|(vh, vp, pk)| {
+                        (vh == &real_host && *vp == real_port).then(|| pk.clone())
+                    })
+            });
         let now = RelayHost::now_str();
         let host = RelayHost {
             id,
@@ -1061,7 +1110,7 @@ impl AgentGateWorkbench {
         }
     }
 
-    /// 异步非阻塞启动单条 SSH 中转监听，避免在 GPUI 主线程调用 `block_on` 造成界面卡顿（修复 [MED-02]）
+    /// 异步非阻塞启动单条 SSH 中转监听，避免在 GPUI 主线程调用 `block_on` 造成界面卡顿（修复 [MED-02] 及固定端口重启竞态）
     fn spawn_start_relay_async(
         &mut self,
         host: RelayHost,
@@ -1070,19 +1119,30 @@ impl AgentGateWorkbench {
         cx: &mut Context<Self>,
     ) {
         let id = host.id;
+        let instance_id = Uuid::new_v4();
+        self.desired_relay_instance.insert(id, instance_id);
         let codename = host.codename.clone();
         let bind_host = host.local_bind_host.clone();
         let tx = self.event_tx.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
         global_tokio_runtime().spawn(async move {
-            let res = start_host_relay(host, live_creds, tx).await;
+            let res = start_host_relay_with_id(host, live_creds, instance_id, tx).await;
             let _ = done_tx.send(res);
         });
 
         cx.spawn(async move |weak_this, cx| {
             if let Ok(handle_res) = done_rx.await {
-                let _ = weak_this.update(cx, |this, cx| {
+                let updated = weak_this.update(cx, |this, cx| {
+                    // 若在异步启动期间用户已停止、删除或发起了更新一轮的重启，立即终止当前过期监听句柄
+                    if this.desired_relay_instance.get(&id).copied() != Some(instance_id)
+                        || !this.hosts.iter().any(|h| h.id == id)
+                    {
+                        if let Ok(stale_ctrl) = handle_res {
+                            stale_ctrl.stop();
+                        }
+                        return;
+                    }
                     match handle_res {
                         Ok(ctrl) => {
                             let port = ctrl.local_port;
@@ -1092,11 +1152,14 @@ impl AgentGateWorkbench {
                                 h.local_port = port;
                                 let _ = this.storage.save_hosts(&this.hosts);
                             }
-                            this.controls.insert(id, ctrl);
+                            if let Some(prev_ctrl) = this.controls.insert(id, ctrl) {
+                                prev_ctrl.stop();
+                            }
                             if let Some(rt) = this.runtimes.get_mut(&id) {
+                                let prev_sessions = rt.status.active_sessions();
                                 rt.status = RelayStatus::Running {
                                     local_port: port,
-                                    active_sessions: 0,
+                                    active_sessions: prev_sessions,
                                 };
                             }
                             this.save_ui_prefs();
@@ -1111,6 +1174,7 @@ impl AgentGateWorkbench {
                             }
                         }
                         Err(err) => {
+                            this.desired_relay_instance.remove(&id);
                             if let Some(rt) = this.runtimes.get_mut(&id) {
                                 rt.status = RelayStatus::Error(err.to_string());
                             }
@@ -1121,6 +1185,7 @@ impl AgentGateWorkbench {
                     }
                     cx.notify();
                 });
+                let _ = updated;
             }
         })
         .detach();
@@ -1130,12 +1195,18 @@ impl AgentGateWorkbench {
     fn spawn_test_upstream(&mut self, host: RelayHost, from_modal: bool, cx: &mut Context<Self>) {
         let id = host.id;
         let codename = host.codename.clone();
+        let target_real_host = host.real_host.clone();
+        let target_real_port = host.real_port;
         self.testing_host_ids.insert(id);
-        if from_modal {
+        let modal_req_seq = if from_modal {
+            self.form_session_seq = self.form_session_seq.wrapping_add(1);
             self.form_testing = true;
             self.form_error = None;
             self.form_test_ok = None;
-        }
+            Some(self.form_session_seq)
+        } else {
+            None
+        };
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.push_log(
                 &codename,
@@ -1164,27 +1235,41 @@ impl AgentGateWorkbench {
             if let Ok(test_res) = done_rx.await {
                 let _ = weak_this.update(cx, |this, cx| {
                     this.testing_host_ids.remove(&id);
-                    if from_modal {
+                    let modal_still_matches = modal_req_seq
+                        .is_some_and(|seq| this.show_host_modal && this.form_session_seq == seq);
+                    if modal_still_matches {
                         this.form_testing = false;
                     }
                     match test_res {
                         Ok((elapsed_ms, pinned_key)) => {
-                            if let Some(pk) = pinned_key
-                                && let Some(h) = this.hosts.iter_mut().find(|h| h.id == id)
-                                && h.pinned_host_key_openssh.is_none()
-                            {
-                                h.pinned_host_key_openssh = Some(pk);
-                                let _ = this.storage.save_hosts(&this.hosts);
+                            if let Some(pk) = pinned_key {
+                                if modal_still_matches {
+                                    this.form_verified_host_key = Some((
+                                        target_real_host.clone(),
+                                        target_real_port,
+                                        pk.clone(),
+                                    ));
+                                }
+                                if let Some(h) = this.hosts.iter_mut().find(|h| h.id == id)
+                                    && h.real_host == target_real_host
+                                    && h.real_port == target_real_port
+                                    && h.pinned_host_key_openssh.is_none()
+                                {
+                                    h.pinned_host_key_openssh = Some(pk);
+                                    let _ = this.storage.save_hosts(&this.hosts);
+                                }
                             }
                             let detail = format!("连接与认证通过 (耗时: {}ms)", elapsed_ms);
                             if let Some(rt) = this.runtimes.get_mut(&id) {
                                 rt.push_log(&codename, "上游测试成功", detail.clone(), false);
                             }
-                            this.status_banner = Some((
-                                format!("代号 [{}] 上游测试成功 — {}", codename, detail),
-                                false,
-                            ));
-                            if from_modal {
+                            if !from_modal || modal_still_matches {
+                                this.status_banner = Some((
+                                    format!("代号 [{}] 上游测试成功 — {}", codename, detail),
+                                    false,
+                                ));
+                            }
+                            if modal_still_matches {
                                 this.form_test_ok = Some(format!("上游测试成功：{}", detail));
                             }
                         }
@@ -1193,11 +1278,13 @@ impl AgentGateWorkbench {
                             if let Some(rt) = this.runtimes.get_mut(&id) {
                                 rt.push_log(&codename, "上游测试失败", err_str.clone(), true);
                             }
-                            this.status_banner = Some((
-                                format!("代号 [{}] 上游测试失败 — {}", codename, err_str),
-                                true,
-                            ));
-                            if from_modal {
+                            if !from_modal || modal_still_matches {
+                                this.status_banner = Some((
+                                    format!("代号 [{}] 上游测试失败 — {}", codename, err_str),
+                                    true,
+                                ));
+                            }
+                            if modal_still_matches {
                                 this.form_error = Some(format!("上游测试失败 — {}", err_str));
                             }
                         }
@@ -1236,8 +1323,7 @@ impl AgentGateWorkbench {
             self.status_banner = Some(("已取消该操作".to_string(), false));
             cx.notify();
         } else if self.show_host_modal {
-            self.show_host_modal = false;
-            self.form_error = None;
+            self.close_host_modal();
             cx.notify();
         }
     }
@@ -1245,6 +1331,7 @@ impl AgentGateWorkbench {
     fn execute_confirmed_action(&mut self, action: PendingAction, cx: &mut Context<Self>) {
         match action {
             PendingAction::StartRelay { id, codename } => {
+                self.desired_relay_instance.remove(&id);
                 if let Some(existing_ctrl) = self.controls.remove(&id) {
                     existing_ctrl.stop();
                 }
@@ -1264,6 +1351,7 @@ impl AgentGateWorkbench {
                 codename,
                 local_port,
             } => {
+                self.desired_relay_instance.remove(&id);
                 if let Some(ctrl) = self.controls.remove(&id) {
                     ctrl.stop();
                 }
@@ -1280,11 +1368,12 @@ impl AgentGateWorkbench {
                 ));
             }
             PendingAction::StopAllRelays { running_count } => {
+                self.desired_relay_instance.clear();
                 for (_, ctrl) in self.controls.drain() {
                     ctrl.stop();
                 }
                 for rt in self.runtimes.values_mut() {
-                    if rt.status.is_running() {
+                    if rt.status.is_running() || matches!(rt.status, RelayStatus::Starting) {
                         rt.status = RelayStatus::Stopped;
                     }
                 }
@@ -1370,7 +1459,10 @@ impl AgentGateWorkbench {
                     .is_some_and(|(_, old_bind, old_port)| {
                         old_bind != &host.local_bind_host || *old_port != host.local_port
                     });
-                if bind_changed && self.controls.contains_key(&id) {
+                let was_active =
+                    self.controls.contains_key(&id) || self.desired_relay_instance.contains_key(&id);
+                if bind_changed && was_active {
+                    self.desired_relay_instance.remove(&id);
                     if let Some(old_ctrl) = self.controls.remove(&id) {
                         old_ctrl.stop();
                     }
@@ -1384,8 +1476,7 @@ impl AgentGateWorkbench {
                 }
 
                 self.selected_host_id = Some(id);
-                self.show_host_modal = false;
-                self.form_error = None;
+                self.close_host_modal();
                 self.save_ui_prefs();
                 self.status_banner = Some((
                     format!("代号 [{}] 已通过 AES-256-GCM 加密写入本机仓库", codename),
@@ -1393,6 +1484,7 @@ impl AgentGateWorkbench {
                 ));
             }
             PendingAction::DeleteHost { id, codename } => {
+                self.desired_relay_instance.remove(&id);
                 if let Some(ctrl) = self.controls.remove(&id) {
                     ctrl.stop();
                 }
@@ -1540,17 +1632,27 @@ impl AgentGateWorkbench {
 
         div()
             .w_full()
+            .flex_shrink_0()
             .px_4()
-            .py_1p5()
-            .bg(theme.bg_surface)
-            .border_b_1()
-            .border_color(theme.border)
+            .py_2()
+            .rounded(px(8.))
+            .bg(if banner_is_err {
+                theme.danger_soft
+            } else {
+                gpui::Hsla::from(theme.bg_surface)
+            })
+            .border_1()
+            .border_color(if banner_is_err {
+                theme.danger
+            } else {
+                theme.border
+            })
             .flex()
             .items_start()
-            .gap_2()
+            .gap_2p5()
             .child(
                 div()
-                    .mt(px(4.))
+                    .mt(px(5.))
                     .size(px(7.))
                     .flex_shrink_0()
                     .rounded(px(3.5))
@@ -1578,15 +1680,21 @@ impl AgentGateWorkbench {
             .values()
             .filter(|r| r.status.is_running())
             .count();
+        let stoppable_count = self
+            .runtimes
+            .values()
+            .filter(|r| r.status.is_running() || matches!(r.status, RelayStatus::Starting))
+            .count();
         let active_sessions: usize = self
             .runtimes
             .values()
             .map(|r| r.status.active_sessions())
             .sum();
         div()
-            .h(px(50.))
+            .h(px(56.))
+            .flex_shrink_0()
             .w_full()
-            .px_4()
+            .px(px(22.))
             .flex()
             .items_center()
             .justify_between()
@@ -1605,9 +1713,9 @@ impl AgentGateWorkbench {
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         div()
-                            .px_2p5()
-                            .h(px(28.))
-                            .rounded(px(5.))
+                            .px_3()
+                            .h(px(30.))
+                            .rounded(px(6.))
                             .bg(theme.accent)
                             .text_color(rgb(0xffffff))
                             .text_size(px(13.))
@@ -1618,9 +1726,9 @@ impl AgentGateWorkbench {
                     )
                     .child(
                         div()
-                            .px_2()
-                            .h(px(24.))
-                            .rounded(px(4.))
+                            .px_2p5()
+                            .h(px(26.))
+                            .rounded(px(5.))
                             .bg(theme.success_soft)
                             .text_color(theme.success)
                             .text_size(px(11.5))
@@ -1630,9 +1738,9 @@ impl AgentGateWorkbench {
                     )
                     .child(
                         div()
-                            .px_2()
-                            .h(px(24.))
-                            .rounded(px(4.))
+                            .px_2p5()
+                            .h(px(26.))
+                            .rounded(px(5.))
                             .bg(theme.accent_soft)
                             .text_color(theme.accent_hover)
                             .text_size(px(11.5))
@@ -1647,46 +1755,57 @@ impl AgentGateWorkbench {
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap_2()
-                    .child(div().w(px(196.)).child(self.search_input.clone()))
+                    .gap_2p5()
+                    .child(div().w(px(216.)).child(self.search_input.clone()))
                     .child(
                         action_button("btn-new-host", "+ 新建", theme, true, false)
+                            .h(px(34.))
+                            .px_3p5()
+                            .rounded(px(6.))
                             .bg(theme.accent)
                             .text_color(rgb(0xffffff))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.reset_form_for_new_host(cx);
                                 this.show_host_modal = true;
+                                let fh = this.form_codename.read(cx).focus_handle(cx);
+                                window.focus(&fh);
                                 cx.notify();
                             })),
                     )
                     .child(
-                        action_button("btn-stop-all", "全停", theme, running_count > 0, true)
+                        action_button("btn-stop-all", "全停", theme, stoppable_count > 0, true)
+                            .h(px(34.))
+                            .px_3()
+                            .rounded(px(6.))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if running_count > 0 {
+                                if stoppable_count > 0 {
                                     this.request_confirmation(
-                                        PendingAction::StopAllRelays { running_count },
+                                        PendingAction::StopAllRelays {
+                                            running_count: stoppable_count,
+                                        },
                                         cx,
                                     );
                                 }
                             })),
                     )
                     .child(
-                        theme_icon_button("btn-theme-toggle", self.is_dark, theme).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        theme_icon_button("btn-theme-toggle", self.is_dark, theme)
+                            .size(px(34.))
+                            .rounded(px(6.))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.is_dark = !this.is_dark;
                                 this.sync_inputs_theme(cx);
                                 this.save_ui_prefs();
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     )
                     .when(cfg!(not(target_os = "macos")), |bar| {
                         bar.child(
                             div()
-                                .pl_1()
+                                .pl_1p5()
                                 .flex()
                                 .items_center()
-                                .gap_1()
+                                .gap_1p5()
                                 .child(
                                     window_ctrl_button("win-btn-min", "—", theme, false).on_click(
                                         cx.listener(|_, _, window, _| {
@@ -1751,34 +1870,51 @@ impl AgentGateWorkbench {
             .collect();
 
         div()
-            .w(px(300.))
+            .w(px(320.))
+            .flex_shrink_0()
             .h_full()
+            .min_h_0()
             .flex()
             .flex_col()
+            .rounded(px(10.))
             .bg(theme.bg_surface)
-            .border_r_1()
+            .border_1()
             .border_color(theme.border)
+            .overflow_hidden()
             .child(
                 div()
-                    .h(px(36.))
-                    .px_3p5()
+                    .h(px(42.))
+                    .flex_shrink_0()
+                    .px_4()
                     .flex()
                     .items_center()
                     .justify_between()
                     .border_b_1()
                     .border_color(theme.border)
-                    .text_size(px(11.5))
+                    .text_size(px(12.))
                     .text_color(theme.text_secondary)
                     .child("机器代号列表")
-                    .child(format!("{} 台", filtered_hosts.len())),
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .bg(theme.bg_subtle)
+                            .text_size(px(11.))
+                            .text_color(theme.text_secondary)
+                            .child(format!("{} 台", filtered_hosts.len())),
+                    ),
             )
             .child(
                 div()
                     .id("host-list-scroll")
                     .flex_1()
-                    .overflow_scroll()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(px(10.))
                     .flex()
                     .flex_col()
+                    .gap(px(8.))
                     .when(filtered_hosts.is_empty(), |this| {
                         this.child(
                             div()
@@ -1798,6 +1934,8 @@ impl AgentGateWorkbench {
                         let is_selected = self.selected_host_id == Some(id);
                         let rt = self.runtimes.get(&id).cloned().unwrap_or_default();
                         let is_running = rt.status.is_running();
+                        let is_starting = matches!(rt.status, RelayStatus::Starting);
+                        let is_error = matches!(rt.status, RelayStatus::Error(_));
                         let active_port = rt.status.local_port().unwrap_or(host.local_port);
                         let bind_host = if host.local_bind_host.trim().is_empty() {
                             "127.0.0.1"
@@ -1825,21 +1963,20 @@ impl AgentGateWorkbench {
                             .id(("host-row", idx))
                             .w_full()
                             .relative()
-                            .px_3()
-                            .py_2p5();
+                            .px_3p5()
+                            .py_3()
+                            .rounded(px(8.))
+                            .border_1();
                         let row_styled = if is_selected {
                             row_base
                                 .bg(selected_bg)
-                                .border_1()
-                                .border_l_4()
                                 .border_color(accent_edge)
                                 .hover(move |s| s.bg(selected_hover_bg))
                         } else {
                             row_base
-                                .bg(theme.bg_surface)
-                                .border_b_1()
+                                .bg(theme.bg_elevated)
                                 .border_color(theme.border)
-                                .hover(|s| s.bg(theme.bg_elevated))
+                                .hover(move |s| s.bg(theme.bg_subtle))
                         };
 
                         row_styled
@@ -1857,6 +1994,7 @@ impl AgentGateWorkbench {
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .gap_2()
                                     .child(
                                         div()
                                             .flex_1()
@@ -1871,6 +2009,10 @@ impl AgentGateWorkbench {
                                                     .rounded(px(3.5))
                                                     .bg(if is_running {
                                                         theme.success
+                                                    } else if is_starting {
+                                                        theme.warning
+                                                    } else if is_error {
+                                                        theme.danger
                                                     } else {
                                                         theme.text_muted
                                                     }),
@@ -1905,71 +2047,83 @@ impl AgentGateWorkbench {
                                                 )
                                             }),
                                     )
-                                    .child({
-                                        let host_test = host.clone();
-                                        let is_testing = self.testing_host_ids.contains(&id);
-                                        action_button(
-                                            ("row-test", idx),
-                                            if is_testing { "测试中" } else { "测试" },
-                                            theme,
-                                            !is_testing,
-                                            false,
-                                        )
-                                        .h(px(23.))
-                                        .px_2()
-                                        .flex_shrink_0()
-                                        .text_size(px(11.))
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.selected_host_id = Some(id);
-                                                if !this.testing_host_ids.contains(&id) {
-                                                    this.spawn_test_upstream(
-                                                        host_test.clone(),
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child({
+                                                let host_test = host.clone();
+                                                let is_testing = self.testing_host_ids.contains(&id);
+                                                action_button(
+                                                    ("row-test", idx),
+                                                    if is_testing { "测试中" } else { "测试" },
+                                                    theme,
+                                                    !is_testing,
+                                                    false,
+                                                )
+                                                .h(px(23.))
+                                                .px_2()
+                                                .flex_shrink_0()
+                                                .text_size(px(11.))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.selected_host_id = Some(id);
+                                                    if !this.testing_host_ids.contains(&id) {
+                                                        this.spawn_test_upstream(
+                                                            host_test.clone(),
+                                                            false,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }))
+                                            })
+                                            .child({
+                                                let codename_toggle = codename.clone();
+                                                let stop_port = rt.status.local_port();
+                                                action_button(
+                                                    ("row-toggle", idx),
+                                                    if is_running {
+                                                        "停止"
+                                                    } else if is_starting {
+                                                        "启动中"
+                                                    } else {
+                                                        "启动"
+                                                    },
+                                                    theme,
+                                                    !is_starting,
+                                                    is_running,
+                                                )
+                                                .h(px(23.))
+                                                .px_2()
+                                                .flex_shrink_0()
+                                                .text_size(px(11.))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if is_starting {
+                                                        return;
+                                                    }
+                                                    this.selected_host_id = Some(id);
+                                                    if let Some(p) = stop_port {
+                                                        this.request_confirmation(
+                                                            PendingAction::StopRelay {
+                                                                id,
+                                                                codename: codename_toggle.clone(),
+                                                                local_port: p,
+                                                            },
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        this.request_confirmation(
+                                                            PendingAction::StartRelay {
+                                                                id,
+                                                                codename: codename_toggle.clone(),
+                                                            },
+                                                            cx,
+                                                        );
+                                                    }
+                                                }))
                                             }),
-                                        )
-                                    })
-                                    .child({
-                                        let codename_toggle = codename.clone();
-                                        let stop_port = rt.status.local_port();
-                                        action_button(
-                                            ("row-toggle", idx),
-                                            if is_running { "停止" } else { "启动" },
-                                            theme,
-                                            true,
-                                            is_running,
-                                        )
-                                        .h(px(23.))
-                                        .px_2()
-                                        .flex_shrink_0()
-                                        .text_size(px(11.))
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.selected_host_id = Some(id);
-                                                if let Some(p) = stop_port {
-                                                    this.request_confirmation(
-                                                        PendingAction::StopRelay {
-                                                            id,
-                                                            codename: codename_toggle.clone(),
-                                                            local_port: p,
-                                                        },
-                                                        cx,
-                                                    );
-                                                } else {
-                                                    this.request_confirmation(
-                                                        PendingAction::StartRelay {
-                                                            id,
-                                                            codename: codename_toggle.clone(),
-                                                        },
-                                                        cx,
-                                                    );
-                                                }
-                                            }),
-                                        )
-                                    }),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1995,13 +2149,17 @@ impl AgentGateWorkbench {
                                         }
                                     ))),
                             )
-                            .child(div().text_size(px(11.)).text_color(theme.text_muted).child(
-                                if host.label.is_empty() {
-                                    host.masked_real_endpoint()
-                                } else {
-                                    host.label.clone()
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_muted)
+                                    .child(if host.label.is_empty() {
+                                        host.masked_real_endpoint()
+                                    } else {
+                                        host.label.clone()
+                                    }),
+                            )
                     })),
             )
     }
@@ -2014,8 +2172,13 @@ impl AgentGateWorkbench {
         let Some(selected_id) = self.selected_host_id else {
             return div()
                 .flex_1()
+                .min_w_0()
                 .h_full()
                 .p_8()
+                .rounded(px(10.))
+                .bg(theme.bg_surface)
+                .border_1()
+                .border_color(theme.border)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2027,8 +2190,16 @@ impl AgentGateWorkbench {
         let Some(host) = self.hosts.iter().find(|h| h.id == selected_id).cloned() else {
             return div()
                 .flex_1()
+                .min_w_0()
                 .h_full()
                 .p_8()
+                .rounded(px(10.))
+                .bg(theme.bg_surface)
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .justify_center()
                 .text_size(px(13.))
                 .text_color(theme.text_muted)
                 .child("未找到选中的主机条目")
@@ -2036,6 +2207,8 @@ impl AgentGateWorkbench {
         };
         let rt = self.runtimes.get(&selected_id).cloned().unwrap_or_default();
         let is_running = rt.status.is_running();
+        let is_starting = matches!(rt.status, RelayStatus::Starting);
+        let is_error = matches!(rt.status, RelayStatus::Error(_));
         let running_port = rt.status.local_port();
         let display_port = running_port.unwrap_or(host.local_port);
         let bind_host = if host.local_bind_host.trim().is_empty() {
@@ -2059,34 +2232,41 @@ impl AgentGateWorkbench {
             .flex_1()
             .min_w_0()
             .h_full()
+            .min_h_0()
             .overflow_hidden()
             .flex()
             .flex_col()
-            .bg(theme.bg_app)
-            // 第一区：主机顶栏（身份、固定监听端口状态、核心操作按钮）
+            .gap(px(14.))
+            // 第一区：主机顶栏卡片（身份、固定监听端口状态、核心操作按钮）
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .px_5()
-                    .py_3p5()
+                    .py_4()
+                    .rounded(px(10.))
                     .bg(theme.bg_surface)
-                    .border_b_1()
+                    .border_1()
                     .border_color(theme.border)
                     .flex()
                     .flex_col()
-                    .gap_1p5()
+                    .gap_2()
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap_3()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
                                     .gap_2p5()
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .text_size(px(17.))
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(theme.text_primary)
@@ -2094,22 +2274,33 @@ impl AgentGateWorkbench {
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .px_2()
                                             .py_0p5()
                                             .rounded(px(4.))
                                             .text_size(px(11.5))
                                             .bg(if is_running {
                                                 theme.success_soft
+                                            } else if is_error {
+                                                theme.danger_soft
                                             } else {
                                                 hsla(0., 0., 0.5, 0.14)
                                             })
                                             .text_color(if is_running {
                                                 theme.success
+                                            } else if is_starting {
+                                                theme.warning
+                                            } else if is_error {
+                                                theme.danger
                                             } else {
                                                 theme.text_secondary
                                             })
                                             .child(if is_running {
                                                 format!("运行中 · {}:{}", bind_host, display_port)
+                                            } else if is_starting {
+                                                format!("启动中 · {}:{}", bind_host, display_port)
+                                            } else if is_error {
+                                                format!("监听异常 · {}:{}", bind_host, display_port)
                                             } else {
                                                 format!("已停止 · 固定端口 {}:{}", bind_host, display_port)
                                             }),
@@ -2117,14 +2308,17 @@ impl AgentGateWorkbench {
                                     .when(!host.label.is_empty(), |d| {
                                         d.child(
                                             div()
+                                                .min_w_0()
+                                                .truncate()
                                                 .text_size(px(12.5))
                                                 .text_color(theme.text_secondary)
                                                 .child(host.label.clone()),
                                         )
-                                            }),
+                                    }),
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .flex()
                                     .items_center()
                                     .gap_2()
@@ -2134,17 +2328,22 @@ impl AgentGateWorkbench {
                                             "detail-toggle-relay",
                                             if is_running {
                                                 "停止"
+                                            } else if is_starting {
+                                                "启动中..."
                                             } else {
                                                 "启动"
                                             },
                                             theme,
-                                            true,
+                                            !is_starting,
                                             is_running,
                                         )
-                                        .when(!is_running, |b| {
+                                        .when(!is_running && !is_starting, |b| {
                                             b.bg(theme.accent).text_color(rgb(0xffffff))
                                         })
                                         .on_click(cx.listener(move |this, _, _, cx| {
+                                            if is_starting {
+                                                return;
+                                            }
                                             if let Some(p) = running_port {
                                                 this.request_confirmation(
                                                     PendingAction::StopRelay {
@@ -2195,9 +2394,11 @@ impl AgentGateWorkbench {
                                             true,
                                             false,
                                         )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                        .on_click(cx.listener(move |this, _, window, cx| {
                                             this.populate_form_from_host(&host_edit, cx);
                                             this.show_host_modal = true;
+                                            let fh = this.form_codename.read(cx).focus_handle(cx);
+                                            window.focus(&fh);
                                             cx.notify();
                                         }))
                                     })
@@ -2224,7 +2425,8 @@ impl AgentGateWorkbench {
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .truncate()
+                            .text_size(px(12.))
                             .text_color(theme.text_muted)
                             .child(format!(
                                 "本机监听: {}:{}   ·   脱敏远端: {}   ·   出站代理: {}   ·   指纹: {}   ·   会话: {} 活跃 / {} 累计",
@@ -2246,25 +2448,22 @@ impl AgentGateWorkbench {
             .child(
                 div()
                     .w_full()
-                    .px_5()
-                    .py_4()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .flex_shrink_0()
                     .flex()
-                    .gap_4()
+                    .gap(px(16.))
                     .child(
                         // 左栏：本地隔离凭证与认证方式
                         div()
                             .flex_1()
                             .min_w_0()
-                            .p_4()
-                            .rounded(px(6.))
+                            .p(px(18.))
+                            .rounded(px(10.))
                             .bg(theme.bg_surface)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .flex_col()
-                            .gap_3()
+                            .gap_3p5()
                             .child(
                                 div()
                                     .flex()
@@ -2352,14 +2551,14 @@ impl AgentGateWorkbench {
                                 div()
                                     .w_full()
                                     .p_3()
-                                    .rounded(px(5.))
+                                    .rounded(px(7.))
                                     .bg(theme.bg_code)
                                     .border_1()
                                     .border_color(theme.border)
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .gap_2()
+                                    .gap_2p5()
                                     .child(
                                         div()
                                             .flex_1()
@@ -2383,6 +2582,7 @@ impl AgentGateWorkbench {
                                             )
                                             .child(
                                                 div()
+                                                    .truncate()
                                                     .text_size(px(12.5))
                                                     .font_weight(gpui::FontWeight::BOLD)
                                                     .text_color(theme.text_primary)
@@ -2403,6 +2603,7 @@ impl AgentGateWorkbench {
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .flex()
                                             .items_center()
                                             .gap_1p5()
@@ -2491,17 +2692,23 @@ impl AgentGateWorkbench {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap_1p5()
+                                    .gap_2()
                                     .text_size(px(12.))
                                     .child(
                                         div()
                                             .flex()
                                             .justify_between()
+                                            .gap_3()
                                             .child(
-                                                div().text_color(theme.text_muted).child("本机固定监听"),
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(theme.text_muted)
+                                                    .child("本机固定监听"),
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_color(theme.text_primary)
                                                     .child(format!("{}:{}", bind_host, display_port)),
                                             ),
@@ -2510,13 +2717,17 @@ impl AgentGateWorkbench {
                                         div()
                                             .flex()
                                             .justify_between()
+                                            .gap_3()
                                             .child(
                                                 div()
+                                                    .flex_shrink_0()
                                                     .text_color(theme.text_muted)
                                                     .child("Agent 登录用户"),
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_color(theme.text_primary)
                                                     .child(host.codename.clone()),
                                             ),
@@ -2525,11 +2736,17 @@ impl AgentGateWorkbench {
                                         div()
                                             .flex()
                                             .justify_between()
+                                            .gap_3()
                                             .child(
-                                                div().text_color(theme.text_muted).child("真实远端目标"),
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(theme.text_muted)
+                                                    .child("真实远端目标"),
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_color(theme.text_secondary)
                                                     .child(host.masked_real_endpoint()),
                                             ),
@@ -2541,14 +2758,14 @@ impl AgentGateWorkbench {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .p_4()
-                            .rounded(px(6.))
+                            .p(px(18.))
+                            .rounded(px(10.))
                             .bg(theme.bg_surface)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .flex_col()
-                            .gap_2p5()
+                            .gap_3p5()
                             .child(
                                 div()
                                     .flex()
@@ -2630,11 +2847,12 @@ impl AgentGateWorkbench {
                             )
                             .child(
                                 div()
+                                    .flex_1()
                                     .w_full()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .p_2p5()
-                                    .rounded(px(5.))
+                                    .p_3()
+                                    .rounded(px(7.))
                                     .bg(theme.bg_code)
                                     .border_1()
                                     .border_color(theme.border)
@@ -2642,11 +2860,12 @@ impl AgentGateWorkbench {
                                     .text_color(theme.text_primary)
                                     .flex()
                                     .flex_col()
-                                    .gap_0p5()
+                                    .justify_center()
+                                    .gap_1()
                                     .children(
                                         snippet_preview
                                             .lines()
-                                            .map(|line| div().child(line.to_string())),
+                                            .map(|line| div().whitespace_normal().child(line.to_string())),
                                     ),
                             ),
                     ),
@@ -2681,6 +2900,8 @@ impl AgentGateWorkbench {
             .top_0()
             .left_0()
             .size_full()
+            .px(px(32.))
+            .py(px(24.))
             .bg(hsla(0., 0., 0., 0.58))
             .flex()
             .items_center()
@@ -2688,25 +2909,27 @@ impl AgentGateWorkbench {
             .on_mouse_down(MouseButton::Left, |_, _, _| {})
             .child(
                 div()
-                    .w(px(660.))
-                    .h(gpui::relative(0.92))
-                    .max_h(gpui::relative(0.92))
+                    .w(px(680.))
+                    .max_w_full()
+                    .h(gpui::relative(0.94))
+                    .max_h(px(650.))
                     .overflow_hidden()
-                    .p_5()
-                    .rounded(px(8.))
+                    .p(px(24.))
+                    .rounded(px(12.))
                     .bg(theme.bg_surface)
                     .border_1()
                     .border_color(theme.border_focus)
                     .shadow_lg()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_3p5()
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_between()
-                            .pb_2p5()
+                            .pb_3()
                             .border_b_1()
                             .border_color(theme.border)
                             .child(
@@ -2725,8 +2948,7 @@ impl AgentGateWorkbench {
                                     .h(px(26.))
                                     .px_2p5()
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_host_modal = false;
-                                        this.form_error = None;
+                                        this.close_host_modal();
                                         cx.notify();
                                     })),
                             ),
@@ -2738,9 +2960,11 @@ impl AgentGateWorkbench {
                             .min_h_0()
                             .flex_1()
                             .overflow_y_scroll()
+                            .pr_1p5()
+                            .py_0p5()
                             .flex()
                             .flex_col()
-                            .gap_3p5()
+                            .gap_4()
                     // 第一行：代号与备注
                     .child(
                         div()
@@ -3300,12 +3524,12 @@ impl AgentGateWorkbench {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .pt_2p5()
+                            .pt_3()
                             .border_t_1()
                             .border_color(theme.border)
                             .flex()
                             .flex_col()
-                            .gap_2()
+                            .gap_2p5()
                             .when(form_feedback.is_some(), |footer| {
                                 let message = form_feedback.clone().unwrap_or_default();
                                 let copy_message = message.clone();
@@ -3362,7 +3586,7 @@ impl AgentGateWorkbench {
                                     .flex_shrink_0()
                                     .items_center()
                                     .justify_end()
-                                    .gap_2()
+                                    .gap_2p5()
                                     .child(
                                         action_button(
                                             "form-test-upstream",
@@ -3401,10 +3625,7 @@ impl AgentGateWorkbench {
                                             false,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_host_modal = false;
-                                            this.form_error = None;
-                                            this.form_test_ok = None;
-                                            this.form_testing = false;
+                                            this.close_host_modal();
                                             cx.notify();
                                         })),
                                     )
@@ -3473,19 +3694,26 @@ impl AgentGateWorkbench {
             .flex_1()
             .min_h_0()
             .w_full()
-            .px_5()
-            .py_3()
+            .p(px(18.))
+            .rounded(px(10.))
+            .bg(theme.bg_surface)
+            .border_1()
+            .border_color(theme.border)
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
+                    .flex_shrink_0()
+                    .pb_2p5()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(13.5))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(theme.text_primary)
                             .child(format!("日志 ({})", all_logs.len())),
@@ -3574,19 +3802,19 @@ impl AgentGateWorkbench {
                     .id("audit-log-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .rounded(px(6.))
-                    .bg(theme.bg_surface)
-                    .border_1()
-                    .border_color(theme.border)
-                    .p_2()
+                    .overflow_y_scroll()
+                    .pr_1()
                     .flex()
                     .flex_col()
-                    .gap_1p5()
+                    .gap_2()
                     .when(all_logs.is_empty(), |d| {
                         d.child(
                             div()
                                 .p_4()
+                                .rounded(px(7.))
+                                .bg(theme.bg_code)
+                                .border_1()
+                                .border_color(theme.border)
                                 .text_size(px(12.))
                                 .text_color(theme.text_muted)
                                 .child("暂无日志记录。启动中转或由 Agent 发起连接后将实时记录详细诊断信息。"),
@@ -3598,16 +3826,16 @@ impl AgentGateWorkbench {
                             entry.timestamp, entry.codename, entry.event, entry.detail
                         );
                         div()
-                            .px_2p5()
-                            .py_1p5()
-                            .rounded(px(4.))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(6.))
                             .bg(theme.bg_code)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap_2()
+                            .gap_3()
                             .text_size(px(11.5))
                             .child(
                                 div()
@@ -3618,11 +3846,13 @@ impl AgentGateWorkbench {
                                     .gap_2()
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .text_color(theme.text_muted)
                                             .child(entry.timestamp),
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .px_1p5()
                                             .py_0p5()
                                             .rounded(px(3.))
@@ -3632,6 +3862,7 @@ impl AgentGateWorkbench {
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(if entry.is_error {
                                                 theme.danger
@@ -3644,6 +3875,7 @@ impl AgentGateWorkbench {
                                         div()
                                             .flex_1()
                                             .min_w_0()
+                                            .whitespace_normal()
                                             .text_color(if entry.is_error {
                                                 theme.danger_hover
                                             } else {
@@ -3656,6 +3888,7 @@ impl AgentGateWorkbench {
                                 action_button(("copy-log-row", idx), "复制", theme, true, false)
                                     .h(px(22.))
                                     .px_2()
+                                    .flex_shrink_0()
                                     .text_size(px(11.))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
@@ -3686,6 +3919,7 @@ impl AgentGateWorkbench {
             .top_0()
             .left_0()
             .size_full()
+            .p(px(28.))
             .bg(hsla(0., 0., 0., 0.62))
             .flex()
             .items_center()
@@ -3694,8 +3928,9 @@ impl AgentGateWorkbench {
             .child(
                 div()
                     .w(px(480.))
-                    .p_5()
-                    .rounded(px(8.))
+                    .max_w_full()
+                    .p(px(24.))
+                    .rounded(px(12.))
                     .bg(theme.bg_surface)
                     .border_1()
                     .border_color(if is_destructive {
@@ -3706,7 +3941,7 @@ impl AgentGateWorkbench {
                     .shadow_lg()
                     .flex()
                     .flex_col()
-                    .gap_3p5()
+                    .gap_4()
                     .child(
                         div()
                             .flex()
@@ -3740,8 +3975,8 @@ impl AgentGateWorkbench {
                     )
                     .child(
                         div()
-                            .p_3()
-                            .rounded(px(5.))
+                            .p_3p5()
+                            .rounded(px(7.))
                             .bg(theme.bg_code)
                             .border_1()
                             .border_color(theme.border)
@@ -3794,7 +4029,23 @@ impl AgentGateWorkbench {
 }
 
 impl Render for AgentGateWorkbench {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 保持焦点链始终挂载在当前活跃视图树上，确保未点击输入框时 Enter / Esc / Tab / Cmd+W 快捷键均可靠触发
+        if self.pending_confirm.is_some() {
+            if !self.focus_handle.is_focused(window) {
+                window.focus(&self.focus_handle);
+            }
+        } else if self.show_host_modal {
+            if window.focused(cx).is_none() || self.focus_handle.is_focused(window) {
+                let fh = self.form_codename.read(cx).focus_handle(cx);
+                window.focus(&fh);
+            }
+        } else if !self.focus_handle.is_focused(window)
+            && !self.search_input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            window.focus(&self.focus_handle);
+        }
+
         let theme = if self.is_dark {
             WorkbenchTheme::dark()
         } else {
@@ -3825,19 +4076,41 @@ impl Render for AgentGateWorkbench {
             .bg(theme.bg_app)
             .text_color(theme.text_primary)
             .child(self.render_top_bar(theme, cx))
-            .child(self.render_status_strip(theme))
             .child(
                 div()
                     .id("agentgate-workspace-body")
                     .track_focus(&self.focus_handle)
                     .flex_1()
+                    .min_h_0()
                     .w_full()
                     .relative()
                     .overflow_hidden()
                     .flex()
-                    .flex_row()
-                    .child(self.render_left_host_list(theme, cx))
-                    .child(self.render_right_workspace(theme, cx))
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("agentgate-workspace-canvas")
+                            .size_full()
+                            .min_h_0()
+                            .px(px(22.))
+                            .pt(px(16.))
+                            .pb(px(22.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .child(self.render_status_strip(theme))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(16.))
+                                    .child(self.render_left_host_list(theme, cx))
+                                    .child(self.render_right_workspace(theme, cx)),
+                            ),
+                    )
                     .when(self.show_host_modal, |body| {
                         body.child(self.render_host_modal(theme, cx))
                     })
@@ -4101,4 +4374,1419 @@ fn action_button(
         })
         .when(!enabled, |b| b.opacity(0.45))
         .child(label.into())
+}
+
+#[cfg(debug_assertions)]
+pub mod live_selftest {
+    use super::*;
+    use bytes::Bytes;
+    use gpui::{
+        Application, Bounds, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        TitlebarOptions, WindowBounds, WindowKind, WindowOptions, size,
+    };
+    use russh::keys::ssh_key::{Algorithm, PublicKey};
+    use russh::server::{Auth, Msg as ServerMsg, Session as ServerSession, VerifiedPublicKey};
+    use russh::{Channel, ChannelId, Pty, server};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    struct LiveProbeUpstreamServer {
+        expected_user: String,
+        expected_password: String,
+        expected_pubkey: Option<PublicKey>,
+        chan_modes: HashMap<ChannelId, String>,
+        chan_stdin_bytes: HashMap<ChannelId, usize>,
+    }
+
+    impl server::Handler for LiveProbeUpstreamServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+            if user == self.expected_user && password == self.expected_password {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            key: VerifiedPublicKey<'_>,
+        ) -> Result<Auth, Self::Error> {
+            if user == self.expected_user
+                && self
+                    .expected_pubkey
+                    .as_ref()
+                    .is_some_and(|pk| pk == key.public_key)
+            {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<ServerMsg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            drop(channel);
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            _term: &str,
+            _col_width: u32,
+            _row_height: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+            _modes: &[(Pty, u32)],
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            let _ = session.channel_success(channel);
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            self.chan_modes.insert(channel, "shell".to_string());
+            let _ = session.channel_success(channel);
+            let _ = session
+                .handle()
+                .data(channel, Bytes::from("LIVE_PTY_READY> "))
+                .await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            let cmd = String::from_utf8_lossy(data).trim().to_string();
+            let _ = session.channel_success(channel);
+            let handle = session.handle();
+            match cmd.as_str() {
+                "sink_count" => {
+                    self.chan_modes.insert(channel, "sink_count".to_string());
+                    self.chan_stdin_bytes.insert(channel, 0);
+                }
+                "big_stdout" => {
+                    tokio::spawn(async move {
+                        let chunk = Bytes::from(vec![b'A'; 16384]);
+                        for _ in 0..32 {
+                            if handle.data(channel, chunk.clone()).await.is_err() {
+                                return;
+                            }
+                        }
+                        let _ = handle.exit_status_request(channel, 0).await;
+                        let _ = handle.eof(channel).await;
+                        let _ = handle.close(channel).await;
+                    });
+                }
+                "stderr_and_exit_42" => {
+                    let _ = handle.data(channel, Bytes::from("OUT_LINE\n")).await;
+                    let _ = handle
+                        .extended_data(channel, 1, Bytes::from("ERR_LINE\n"))
+                        .await;
+                    let _ = handle.exit_status_request(channel, 42).await;
+                    let _ = handle.eof(channel).await;
+                    let _ = handle.close(channel).await;
+                }
+                _ => {
+                    let reply = format!("EXEC_OK:{}\n", cmd);
+                    let _ = handle.data(channel, Bytes::from(reply)).await;
+                    let _ = handle.exit_status_request(channel, 0).await;
+                    let _ = handle.eof(channel).await;
+                    let _ = handle.close(channel).await;
+                }
+            }
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            name: &str,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            if name == "echo_subsys" {
+                let _ = session.channel_success(channel);
+                let handle = session.handle();
+                let _ = handle.data(channel, Bytes::from("SUBSYS_OK\n")).await;
+                let _ = handle.exit_status_request(channel, 0).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            } else {
+                let _ = session.channel_failure(channel);
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            match self.chan_modes.get(&channel).map(String::as_str) {
+                Some("sink_count") => {
+                    *self.chan_stdin_bytes.entry(channel).or_insert(0) += data.len();
+                }
+                Some("shell") => {
+                    let s = String::from_utf8_lossy(data);
+                    let handle = session.handle();
+                    let _ = handle
+                        .data(channel, Bytes::from(format!("PTY_ECHO:{}", s)))
+                        .await;
+                    if s.contains("exit") {
+                        let _ = handle.exit_status_request(channel, 0).await;
+                        let _ = handle.eof(channel).await;
+                        let _ = handle.close(channel).await;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: ChannelId,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            if self.chan_modes.get(&channel).map(String::as_str) == Some("sink_count") {
+                let total = self.chan_stdin_bytes.get(&channel).copied().unwrap_or(0);
+                let handle = session.handle();
+                let _ = handle
+                    .data(channel, Bytes::from(format!("STDIN_BYTES:{}\n", total)))
+                    .await;
+                let _ = handle.exit_status_request(channel, 0).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            }
+            Ok(())
+        }
+    }
+
+    pub fn run_live_workbench_selftest() {
+        let temp_root: PathBuf =
+            std::env::temp_dir().join(format!("agentgate-selftest-{}", Uuid::new_v4().simple()));
+        let data_dir = temp_root.join("agentgate_data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        unsafe {
+            std::env::set_var("AGENTGATE_DATA_DIR", &data_dir);
+            std::env::set_var("AGENTGATE_DEMO_SEED", "1");
+        }
+
+        // 启动真实上游模拟 SSH 服务器 + 慢速 Tarpit 端口（用于测试模态框关闭后异步回调串台）
+        let rt_handle = global_tokio_runtime();
+        let (remote_port, tarpit_port) = rt_handle.block_on(async {
+            let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
+            let r_port = remote_listener.local_addr().unwrap().port();
+            let remote_key =
+                PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("remote key");
+            let remote_cfg = Arc::new(server::Config {
+                keys: vec![remote_key],
+                auth_rejection_time: Duration::from_millis(10),
+                auth_rejection_time_initial: Some(Duration::from_millis(0)),
+                ..Default::default()
+            });
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = remote_listener.accept().await {
+                    let cfg = remote_cfg.clone();
+                    tokio::spawn(async move {
+                        let handler = LiveProbeUpstreamServer {
+                            expected_user: "real_ops_admin".to_string(),
+                            expected_password: "RealUpstreamSecret#2026".to_string(),
+                            expected_pubkey: None,
+                            chan_modes: HashMap::new(),
+                            chan_stdin_bytes: HashMap::new(),
+                        };
+                        let _ = server::run_stream(cfg, socket, handler).await;
+                    });
+                }
+            });
+
+            let tarpit_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tarpit");
+            let t_port = tarpit_listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = tarpit_listener.accept().await {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(350)).await;
+                        drop(socket);
+                    });
+                }
+            });
+
+            (r_port, t_port)
+        });
+
+        let findings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let findings_ref = findings.clone();
+        let temp_path = temp_root.clone();
+
+        Application::new().run(move |cx: &mut App| {
+            register_workbench_keys(cx);
+            cx.activate(true);
+            let orig_clipboard = cx.read_from_clipboard().and_then(|c| c.text());
+
+            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            let win_handle = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(1040.0), px(680.0))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("AgentGate-LiveTest".into()),
+                            appears_transparent: false,
+                            traffic_light_position: None,
+                        }),
+                        focus: true,
+                        show: true,
+                        kind: WindowKind::Normal,
+                        is_movable: true,
+                        is_resizable: true,
+                        is_minimizable: true,
+                        ..Default::default()
+                    },
+                    |window, cx| cx.new(|cx| AgentGateWorkbench::new(window, cx)),
+                )
+                .expect("open live GPUI window");
+
+            let entity = win_handle.entity(cx).expect("workbench entity");
+            let findings_inner = findings_ref.clone();
+
+            cx.spawn(async move |cx| {
+                let record = |msg: String| {
+                    println!("{}", msg);
+                    findings_inner.lock().unwrap().push(msg);
+                };
+
+                // 等待首次渲染与异步启动完成
+                cx.background_executor()
+                    .timer(Duration::from_millis(550))
+                    .await;
+
+                // === Phase 1: 启动状态、Demo Seed 与顶栏布局边界 ===
+                let _ = win_handle.update(cx, |this, window, cx| {
+                    let vp = window.viewport_size();
+                    record(format!(
+                        "[INFO] Phase 1 viewport = {:?}, hosts = {}",
+                        vp,
+                        this.hosts.len()
+                    ));
+                    if let Some((msg, is_err)) = &this.status_banner {
+                        if *is_err {
+                            record(format!(
+                                "[FAIL] Phase 1 startup status_banner has error: {}",
+                                msg
+                            ));
+                        } else {
+                            record(format!("[PASS] Phase 1 startup status_banner ok: {}", msg));
+                        }
+                    }
+                    let running_codes: Vec<String> = this
+                        .hosts
+                        .iter()
+                        .filter(|h| {
+                            this.runtimes
+                                .get(&h.id)
+                                .is_some_and(|r| r.status.is_running())
+                        })
+                        .map(|h| h.codename.clone())
+                        .collect();
+                    if running_codes.len() != 1 {
+                        record(format!(
+                            "[FAIL] Phase 1 demo_seed expected only h1 running, but running = {:?}",
+                            running_codes
+                        ));
+                    } else {
+                        record(format!(
+                            "[PASS] Phase 1 demo_seed running hosts = {:?}",
+                            running_codes
+                        ));
+                    }
+                    if let Some(sb) = this.search_input.read(cx).last_bounds() {
+                        record(format!("[INFO] Phase 1 search_input bounds = {:?}", sb));
+                    } else {
+                        record("[FAIL] Phase 1 search_input did not paint bounds".to_string());
+                    }
+
+                    // 1b: 验证在未点击任何输入框前打开确认弹窗，直接按 Esc 即可关闭弹窗（焦点链完整性验证）
+                    let h1 = this.hosts[0].clone();
+                    this.request_confirmation(
+                        PendingAction::CopyAgentConfig {
+                            id: h1.id,
+                            codename: h1.codename.clone(),
+                            format: CopyFormat::AgentPromptCard,
+                        },
+                        cx,
+                    );
+                });
+
+                let any_win_init: gpui::AnyWindowHandle = win_handle.into();
+                let _ = any_win_init.update(cx, |_, window, cx| {
+                    let _ = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                });
+
+                let _ = win_handle.update(cx, |this, window, cx| {
+                    if this.pending_confirm.is_none() {
+                        record(
+                            "[PASS] Phase 1b Escape dismissed confirm modal without prior input click"
+                                .to_string(),
+                        );
+                    } else {
+                        record(
+                            "[FAIL] Phase 1b Escape failed to dismiss confirm modal without prior input click"
+                                .to_string(),
+                        );
+                        this.pending_confirm = None;
+                    }
+
+                    // 打开主机编辑弹窗进入 Phase 2
+                    let h1 = this.hosts[0].clone();
+                    this.populate_form_from_host(&h1, cx);
+                    this.show_host_modal = true;
+                    let fh = this.form_codename.read(cx).focus_handle(cx);
+                    window.focus(&fh);
+                    window.activate_window();
+                    cx.notify();
+                    window.refresh();
+                });
+
+                for _ in 0..12 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(60))
+                        .await;
+                    let painted = win_handle
+                        .update(cx, |this, window, cx| {
+                            if this.form_codename.read(cx).last_bounds().is_some() {
+                                true
+                            } else {
+                                cx.activate(true);
+                                window.activate_window();
+                                window.refresh();
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if painted {
+                        break;
+                    }
+                }
+
+                // === Phase 2: 实机窗口鼠标单击/双击/三击全选 + 抖动容错 + Cmd+C ===
+                let _ = win_handle.update(cx, |this, window, cx| {
+                    let Some(cb) = this.form_codename.read(cx).last_bounds() else {
+                        record("[FAIL] Phase 2 form_codename last_bounds is None".to_string());
+                        return;
+                    };
+                    record(format!("[INFO] Phase 2 form_codename bounds = {:?}", cb));
+
+                    // 检查模态框外边距（窗口宽 1280，模态框宽 680 居中，左右应 > 280px 且 < 1000px）
+                    if cb.left() < px(280.) || cb.right() > px(1000.) {
+                        record(format!(
+                            "[FAIL] Phase 2 form_codename outside expected centered modal margins: {:?}",
+                            cb
+                        ));
+                    } else {
+                        record("[PASS] Phase 2 modal input outer margins verified".to_string());
+                    }
+
+                    let click_pt = gpui::point(cb.left() + px(22.), cb.center().y);
+
+                    // 1) 单击
+                    this.form_codename.update(cx, |f, cx| {
+                        f.on_mouse_down(
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        f.on_mouse_up(
+                            &MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                    let r1 = this.form_codename.read(cx).selected_range();
+                    if r1.is_empty() && r1.start > 0 && r1.start < 15 {
+                        record(format!("[PASS] Phase 2 single-click placed cursor at {:?}", r1));
+                    } else {
+                        record(format!("[FAIL] Phase 2 single-click unexpected range {:?}", r1));
+                    }
+
+                    // 2) 双击 + 2px 抖动（应选中首词 "cobalt" = 0..6）
+                    this.form_codename.update(cx, |f, cx| {
+                        f.on_mouse_down(
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 2,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        f.on_mouse_move(
+                            &MouseMoveEvent {
+                                position: gpui::point(click_pt.x + px(2.), click_pt.y + px(1.)),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            },
+                            window,
+                            cx,
+                        );
+                        f.on_mouse_up(
+                            &MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 2,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                    let r2 = this.form_codename.read(cx).selected_range();
+                    if r2 == (0..6) {
+                        record("[PASS] Phase 2 double-click + jitter selected 'cobalt' (0..6)".to_string());
+                    } else {
+                        record(format!("[FAIL] Phase 2 double-click expected 0..6, got {:?}", r2));
+                    }
+
+                    // 3) 三击 + 6px 鼠标抖动（必须全选整个 "cobalt-nexus-01" = 0..15）
+                    this.form_codename.update(cx, |f, cx| {
+                        f.on_mouse_down(
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 3,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        f.on_mouse_move(
+                            &MouseMoveEvent {
+                                position: gpui::point(click_pt.x + px(6.), click_pt.y - px(2.)),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            },
+                            window,
+                            cx,
+                        );
+                        f.on_mouse_up(
+                            &MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: click_pt,
+                                modifiers: Modifiers::default(),
+                                click_count: 3,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                    let r3 = this.form_codename.read(cx).selected_range();
+                    let full_len = this.form_codename.read(cx).text().len();
+                    if r3 == (0..full_len) && full_len == 15 {
+                        record("[PASS] Phase 2 triple-click + jitter selected ALL (0..15)".to_string());
+                    } else {
+                        record(format!(
+                            "[FAIL] Phase 2 triple-click expected 0..{}, got {:?}",
+                            full_len, r3
+                        ));
+                    }
+
+                    // 5) 缩放窗口至最小尺寸 1040x680 验证不崩溃
+                    window.resize(size(px(1040.0), px(680.0)));
+                    window.refresh();
+                });
+
+                // 4) 在不持有 AgentGateWorkbench 借用的窗口上下文中派发真实按键 Cmd+C
+                let any_win: gpui::AnyWindowHandle = win_handle.into();
+                let _ = any_win.update(cx, |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string("__INIT__".to_string()));
+                    let _ = window.dispatch_keystroke(Keystroke::parse("cmd-c").unwrap(), cx);
+                    let clip_after = cx.read_from_clipboard().and_then(|c| c.text());
+                    if clip_after.as_deref() == Some("cobalt-nexus-01") {
+                        record("[PASS] Phase 2 Cmd+C copied triple-click selection".to_string());
+                    } else {
+                        record(format!(
+                            "[FAIL] Phase 2 Cmd+C clipboard = {:?}",
+                            clip_after
+                        ));
+                    }
+                });
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+
+                // === Phase 3: 模态框 Esc 关闭状态清理与慢速测试串台检查 ===
+                let _ = win_handle.update(cx, |this, _window, cx| {
+                    let mut tarpit_host = this.hosts[0].clone();
+                    tarpit_host.real_host = "127.0.0.1".to_string();
+                    tarpit_host.real_port = tarpit_port;
+                    tarpit_host.proxy = ProxyConfig::None;
+                    this.form_test_ok = Some("上次残留成功提示".to_string());
+                    this.spawn_test_upstream(tarpit_host, true, cx);
+                });
+
+                let _ = any_win.update(cx, |_, window, cx| {
+                    // 按 Esc 关闭编辑弹窗
+                    let _ = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                });
+
+                let _ = win_handle.update(cx, |this, _window, cx| {
+                    if this.show_host_modal {
+                        record("[FAIL] Phase 3 Escape did not close host modal".to_string());
+                    }
+                    if this.form_testing || this.form_test_ok.is_some() {
+                        record(format!(
+                            "[FAIL] Phase 3 Escape left stale modal state: form_testing={}, form_test_ok={:?}",
+                            this.form_testing, this.form_test_ok
+                        ));
+                    } else {
+                        record("[PASS] Phase 3 Escape cleaned modal test state".to_string());
+                    }
+
+                    // 立即点击「+ 新建」打开新表单，等待刚才 350ms 的 tarpit 测试返回
+                    this.reset_form_for_new_host(cx);
+                    this.show_host_modal = true;
+                    cx.notify();
+                });
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+
+                let _ = win_handle.update(cx, |this, _window, cx| {
+                    if let Some(leaked_err) = &this.form_error {
+                        record(format!(
+                            "[FAIL] Phase 3 stale upstream test leaked error into newly opened modal: {}",
+                            leaked_err
+                        ));
+                    } else {
+                        record("[PASS] Phase 3 no stale upstream test leakage into new modal".to_string());
+                    }
+                    this.show_host_modal = false;
+                    cx.notify();
+                });
+
+                // === Phase 4: 固定端口 Stop -> 立即 Start 及运行中重复 Start 竞态测试 ===
+                let probe_port = RelayHost::allocate_free_local_port("127.0.0.1");
+                let probe_pwd = "ProbeLocalPwd-2026-AbcXyz".to_string();
+                let probe_id = Uuid::new_v4();
+                let probe_host = RelayHost {
+                    id: probe_id,
+                    codename: "live-probe-01".to_string(),
+                    label: "实机探针节点".to_string(),
+                    local_bind_host: "127.0.0.1".to_string(),
+                    local_port: probe_port,
+                    agent_password: probe_pwd.clone(),
+                    real_host: "127.0.0.1".to_string(),
+                    real_port: remote_port,
+                    real_user: "real_ops_admin".to_string(),
+                    real_auth: RealAuthConfig::Password {
+                        password: "RealUpstreamSecret#2026".to_string(),
+                    },
+                    proxy: ProxyConfig::None,
+                    agent_auth_mode: AgentAuthMode::EphemeralPassword,
+                    dedicated_key_openssh_pem: None,
+                    pinned_host_key_openssh: None,
+                    created_at: RelayHost::now_str(),
+                    updated_at: RelayHost::now_str(),
+                };
+
+                let _ = entity.update(cx, |this, cx| {
+                    this.execute_confirmed_action(
+                        PendingAction::SaveHost {
+                            host: Box::new(probe_host.clone()),
+                            is_new: true,
+                        },
+                        cx,
+                    );
+                    this.execute_confirmed_action(
+                        PendingAction::StartRelay {
+                            id: probe_id,
+                            codename: "live-probe-01".to_string(),
+                        },
+                        cx,
+                    );
+                });
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+
+                // 执行 StopRelay 紧接着立即 StartRelay（同固定端口 probe_port）
+                let _ = entity.update(cx, |this, cx| {
+                    this.execute_confirmed_action(
+                        PendingAction::StopRelay {
+                            id: probe_id,
+                            codename: "live-probe-01".to_string(),
+                            local_port: probe_port,
+                        },
+                        cx,
+                    );
+                    this.execute_confirmed_action(
+                        PendingAction::StartRelay {
+                            id: probe_id,
+                            codename: "live-probe-01".to_string(),
+                        },
+                        cx,
+                    );
+                });
+
+                // 等待超过 80ms 轮询周期，观察旧实例的 RelayEvent::Stopped 是否误杀新实例！
+                cx.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+
+                let mut key_path_opt: Option<String> = None;
+                let _ = entity.update(cx, |this, _cx| {
+                    let rt = this.runtimes.get(&probe_id).cloned().unwrap_or_default();
+                    let has_ctrl = this.controls.contains_key(&probe_id);
+                    key_path_opt = rt.dedicated_key_path.clone();
+                    if rt.status.is_running() && has_ctrl {
+                        record(format!(
+                            "[PASS] Phase 4 fixed-port Stop->Start stayed Running on :{}",
+                            probe_port
+                        ));
+                    } else {
+                        record(format!(
+                            "[FAIL] Phase 4 fixed-port Stop->Start broken! status={:?}, has_ctrl={}",
+                            rt.status, has_ctrl
+                        ));
+                    }
+                });
+
+                // 若 Phase 4 被误杀，再重新启动一次以便继续执行 Phase 5~7 协议实测
+                let need_restart = entity
+                    .read_with(cx, |this, _| !this.controls.contains_key(&probe_id))
+                    .unwrap_or(false);
+                if need_restart {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.execute_confirmed_action(
+                            PendingAction::StartRelay {
+                                id: probe_id,
+                                codename: "live-probe-01".to_string(),
+                            },
+                            cx,
+                        );
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                }
+
+                // === Phase 5 & 6: 调用系统真实 /usr/bin/ssh 执行全矩阵实测 ===
+                let askpass_script = temp_path.join("askpass.sh");
+                std::fs::write(
+                    &askpass_script,
+                    format!("#!/bin/sh\necho '{}'\n", probe_pwd),
+                )
+                .expect("write askpass");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        &askpass_script,
+                        std::fs::Permissions::from_mode(0o700),
+                    )
+                    .expect("chmod askpass");
+                }
+
+                let key_path_str = key_path_opt.unwrap_or_default();
+                let askpass_str = askpass_script.to_string_lossy().to_string();
+
+                let ssh_results = global_tokio_runtime()
+                    .spawn_blocking(move || {
+                        let mut logs = Vec::new();
+
+                        // 5a: 默认密码认证 (SSH_ASKPASS_REQUIRE=force, PubkeyAuthentication=no)
+                        let out_pwd = std::process::Command::new("ssh")
+                            .env("SSH_ASKPASS", &askpass_str)
+                            .env("SSH_ASKPASS_REQUIRE", "force")
+                            .env("DISPLAY", ":0")
+                            .args([
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "PubkeyAuthentication=no",
+                                "-o",
+                                "ConnectTimeout=5",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "hello_pwd",
+                            ])
+                            .output()
+                            .expect("ssh pwd");
+                        if out_pwd.status.success()
+                            && String::from_utf8_lossy(&out_pwd.stdout).trim() == "EXEC_OK:hello_pwd"
+                        {
+                            logs.push("[PASS] Phase 5a real /usr/bin/ssh password auth via SSH_ASKPASS".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 5a ssh password auth failed: status={}, stdout={:?}, stderr={:?}",
+                                out_pwd.status,
+                                String::from_utf8_lossy(&out_pwd.stdout),
+                                String::from_utf8_lossy(&out_pwd.stderr)
+                            ));
+                        }
+
+                        // 5b: 强制 keyboard-interactive 认证（模拟 MobaXterm / PAM 客户端）
+                        let out_kbd = std::process::Command::new("ssh")
+                            .env("SSH_ASKPASS", &askpass_str)
+                            .env("SSH_ASKPASS_REQUIRE", "force")
+                            .env("DISPLAY", ":0")
+                            .args([
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "PreferredAuthentications=keyboard-interactive",
+                                "-o",
+                                "ConnectTimeout=5",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "hello_kbd",
+                            ])
+                            .output()
+                            .expect("ssh kbd");
+                        if out_kbd.status.success()
+                            && String::from_utf8_lossy(&out_kbd.stdout).trim() == "EXEC_OK:hello_kbd"
+                        {
+                            logs.push("[PASS] Phase 5b real /usr/bin/ssh keyboard-interactive auth".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 5b ssh keyboard-interactive auth rejected (MethodSet missing KeyboardInteractive?): stderr={:?}",
+                                String::from_utf8_lossy(&out_kbd.stderr)
+                            ));
+                        }
+
+                        // 6a: 专用 Ed25519 密钥认证（即使当前面板处于 EphemeralPassword 模式也应同时生效）
+                        let out_key = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "hello_key",
+                            ])
+                            .output()
+                            .expect("ssh key");
+                        if out_key.status.success()
+                            && String::from_utf8_lossy(&out_key.stdout).trim() == "EXEC_OK:hello_key"
+                        {
+                            logs.push("[PASS] Phase 6a real /usr/bin/ssh dedicated key auth".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6a ssh key auth failed: stderr={:?}",
+                                String::from_utf8_lossy(&out_key.stderr)
+                            ));
+                        }
+
+                        // 6b: 512KB 大数据流 stdin 管道写入 + EOF 传递测试
+                        use std::io::Write;
+                        let mut child_in = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "sink_count",
+                            ])
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .spawn()
+                            .expect("spawn ssh sink_count");
+                        let payload = vec![b'X'; 524_288];
+                        if let Some(mut stdin) = child_in.stdin.take() {
+                            let _ = stdin.write_all(&payload);
+                        }
+                        let out_sink = child_in.wait_with_output().expect("wait sink_count");
+                        let sink_stdout = String::from_utf8_lossy(&out_sink.stdout).trim().to_string();
+                        if out_sink.status.success() && sink_stdout == "STDIN_BYTES:524288" {
+                            logs.push("[PASS] Phase 6b 512KB piped stdin + EOF flow control".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6b 512KB piped stdin failed: status={}, stdout={:?}, stderr={:?}",
+                                out_sink.status,
+                                sink_stdout,
+                                String::from_utf8_lossy(&out_sink.stderr)
+                            ));
+                        }
+
+                        // 6c: 512KB 大数据流 stdout 下行读取测试
+                        let out_big = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "big_stdout",
+                            ])
+                            .output()
+                            .expect("ssh big_stdout");
+                        if out_big.status.success() && out_big.stdout.len() == 524_288 {
+                            logs.push("[PASS] Phase 6c 512KB upstream stdout streaming".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6c 512KB stdout expected 524288 bytes, got {} (status={})",
+                                out_big.stdout.len(),
+                                out_big.status
+                            ));
+                        }
+
+                        // 6d: stdout / stderr 通道分离与非零退出码 42 透传
+                        let out_err42 = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "LogLevel=ERROR",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "stderr_and_exit_42",
+                            ])
+                            .output()
+                            .expect("ssh exit 42");
+                        if out_err42.status.code() == Some(42)
+                            && out_err42.stdout == b"OUT_LINE\n"
+                            && String::from_utf8_lossy(&out_err42.stderr).contains("ERR_LINE")
+                        {
+                            logs.push("[PASS] Phase 6d stdout/stderr separation & exit code 42".to_string());
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6d exit42 mismatch: code={:?}, stdout={:?}, stderr={:?}",
+                                out_err42.status.code(),
+                                String::from_utf8_lossy(&out_err42.stdout),
+                                String::from_utf8_lossy(&out_err42.stderr)
+                            ));
+                        }
+
+                        // 6e: direct-tcpip (-W) 与 tcpip-forward (-R) 端口转发拦截测试
+                        let out_fwd_w = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "ConnectTimeout=5",
+                                "-W",
+                                "127.0.0.1:80",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                            ])
+                            .output()
+                            .expect("ssh -W");
+                        let out_fwd_r = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "ExitOnForwardFailure=yes",
+                                "-R",
+                                "0:127.0.0.1:80",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "hello_r",
+                            ])
+                            .output()
+                            .expect("ssh -R");
+                        if !out_fwd_w.status.success() && !out_fwd_r.status.success() {
+                            logs.push(
+                                "[PASS] Phase 6e direct-tcpip (-W) & tcpip-forward (-R) blocked as expected"
+                                    .to_string(),
+                            );
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6e port forwarding was not blocked: -W={}, -R={}",
+                                out_fwd_w.status, out_fwd_r.status
+                            ));
+                        }
+
+                        // 6f: 子系统透传与不存在子系统快速返回 CHANNEL_FAILURE（不卡死）测试
+                        let out_sub_ok = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "-s",
+                                "live-probe-01@127.0.0.1",
+                                "echo_subsys",
+                            ])
+                            .output()
+                            .expect("ssh -s echo_subsys");
+                        let out_sub_bad = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &key_path_str,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "-s",
+                                "live-probe-01@127.0.0.1",
+                                "nonexistent_subsys",
+                            ])
+                            .output()
+                            .expect("ssh -s nonexistent_subsys");
+                        if out_sub_ok.status.success()
+                            && String::from_utf8_lossy(&out_sub_ok.stdout).trim() == "SUBSYS_OK"
+                            && !out_sub_bad.status.success()
+                        {
+                            logs.push(
+                                "[PASS] Phase 6f subsystem success & fast CHANNEL_FAILURE propagation"
+                                    .to_string(),
+                            );
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 6f subsystem mismatch: ok=({},{:?}), bad={}",
+                                out_sub_ok.status,
+                                String::from_utf8_lossy(&out_sub_ok.stdout),
+                                out_sub_bad.status
+                            ));
+                        }
+
+                        // 7a: 真实伪终端交互式 Shell (`ssh -tt`) 测试
+                        let pty_py = r#"
+import os, pty, select, subprocess, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("ssh", [
+        "ssh", "-tt",
+        "-i", sys.argv[1],
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-p", sys.argv[2],
+        "live-probe-01@127.0.0.1"
+    ])
+buf = b""
+sent = False
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.1)
+    if r:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if (not sent) and b"LIVE_PTY_READY>" in buf:
+            os.write(fd, b"ping_pty_ok\nexit\n")
+            sent = True
+    wpid, status = os.waitpid(pid, os.WNOHANG)
+    if wpid == pid:
+        break
+os.close(fd)
+sys.stdout.buffer.write(buf)
+"#;
+                        let out_pty = std::process::Command::new("python3")
+                            .args(["-c", pty_py, &key_path_str, &probe_port.to_string()])
+                            .output()
+                            .expect("python3 pty ssh -tt");
+                        let pty_str = String::from_utf8_lossy(&out_pty.stdout);
+                        if out_pty.status.success()
+                            && pty_str.contains("LIVE_PTY_READY>")
+                            && pty_str.contains("PTY_ECHO:ping_pty_ok")
+                        {
+                            logs.push(
+                                "[PASS] Phase 7a real interactive PTY terminal (`ssh -tt`) session"
+                                    .to_string(),
+                            );
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 7a interactive PTY failed: status={}, out={:?}, err={:?}",
+                                out_pty.status,
+                                pty_str,
+                                String::from_utf8_lossy(&out_pty.stderr)
+                            ));
+                        }
+
+                        logs
+                    })
+                    .await
+                    .expect("join ssh probe");
+
+                for line in ssh_results {
+                    record(line);
+                }
+
+                // === Phase 7b: 热轮换密码与专用密钥（旧凭证立即失效、新凭证立即通过）+ 持久化校验 ===
+                let old_pwd = probe_pwd.clone();
+                let mut rotated_pwd = String::new();
+                let mut rotated_key_path = String::new();
+                let old_key_copy = temp_path.join("old_agent_key");
+                if let Some(existing_kp) = entity
+                    .read_with(cx, |this, _| {
+                        this.runtimes
+                            .get(&probe_id)
+                            .and_then(|r| r.dedicated_key_path.clone())
+                    })
+                    .ok()
+                    .flatten()
+                {
+                    let _ = std::fs::copy(&existing_kp, &old_key_copy);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &old_key_copy,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
+
+                let _ = entity.update(cx, |this, cx| {
+                    this.execute_confirmed_action(
+                        PendingAction::RotateCredentials {
+                            id: probe_id,
+                            codename: "live-probe-01".to_string(),
+                            mode: AgentAuthMode::EphemeralPassword,
+                        },
+                        cx,
+                    );
+                    this.execute_confirmed_action(
+                        PendingAction::RotateCredentials {
+                            id: probe_id,
+                            codename: "live-probe-01".to_string(),
+                            mode: AgentAuthMode::DedicatedKey,
+                        },
+                        cx,
+                    );
+                    if let Some(h) = this.hosts.iter().find(|h| h.id == probe_id) {
+                        rotated_pwd = h.agent_password.clone();
+                    }
+                    if let Some(rt) = this.runtimes.get(&probe_id) {
+                        rotated_key_path = rt.dedicated_key_path.clone().unwrap_or_default();
+                    }
+                });
+
+                let new_askpass = temp_path.join("askpass_new.sh");
+                std::fs::write(&new_askpass, format!("#!/bin/sh\necho '{}'\n", rotated_pwd))
+                    .expect("write new askpass");
+                let old_askpass = temp_path.join("askpass_old.sh");
+                std::fs::write(&old_askpass, format!("#!/bin/sh\necho '{}'\n", old_pwd))
+                    .expect("write old askpass");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &new_askpass,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                    let _ = std::fs::set_permissions(
+                        &old_askpass,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                }
+                let old_askpass_s = old_askpass.to_string_lossy().to_string();
+                let new_askpass_s = new_askpass.to_string_lossy().to_string();
+                let old_key_s = old_key_copy.to_string_lossy().to_string();
+
+                let rot_logs = global_tokio_runtime()
+                    .spawn_blocking(move || {
+                        let mut logs = Vec::new();
+                        let old_p = std::process::Command::new("ssh")
+                            .env("SSH_ASKPASS", &old_askpass_s)
+                            .env("SSH_ASKPASS_REQUIRE", "force")
+                            .env("DISPLAY", ":0")
+                            .args([
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "PubkeyAuthentication=no",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "old_pwd_check",
+                            ])
+                            .output()
+                            .expect("old pwd ssh");
+                        let new_p = std::process::Command::new("ssh")
+                            .env("SSH_ASKPASS", &new_askpass_s)
+                            .env("SSH_ASKPASS_REQUIRE", "force")
+                            .env("DISPLAY", ":0")
+                            .args([
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-o",
+                                "PubkeyAuthentication=no",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "new_pwd_check",
+                            ])
+                            .output()
+                            .expect("new pwd ssh");
+                        let old_k = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &old_key_s,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "old_key_check",
+                            ])
+                            .output()
+                            .expect("old key ssh");
+                        let new_k = std::process::Command::new("ssh")
+                            .args([
+                                "-i",
+                                &rotated_key_path,
+                                "-o",
+                                "IdentitiesOnly=yes",
+                                "-o",
+                                "BatchMode=yes",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "UserKnownHostsFile=/dev/null",
+                                "-p",
+                                &probe_port.to_string(),
+                                "live-probe-01@127.0.0.1",
+                                "new_key_check",
+                            ])
+                            .output()
+                            .expect("new key ssh");
+                        if !old_p.status.success()
+                            && new_p.status.success()
+                            && !old_k.status.success()
+                            && new_k.status.success()
+                        {
+                            logs.push(
+                                "[PASS] Phase 7b live password & Ed25519 key hot-rotation invalidated old creds immediately"
+                                    .to_string(),
+                            );
+                        } else {
+                            logs.push(format!(
+                                "[FAIL] Phase 7b credential rotation mismatch: old_p={}, new_p={}, old_k={}, new_k={}",
+                                old_p.status, new_p.status, old_k.status, new_k.status
+                            ));
+                        }
+                        logs
+                    })
+                    .await
+                    .expect("join rot check");
+
+                for line in rot_logs {
+                    record(line);
+                }
+
+                // === Phase 7c: 验证弹窗「测试连接」TOFU 公钥直接带入新建主机 + AES-GCM 磁盘重载一致性 ===
+                let _ = win_handle.update(cx, |this, _window, cx| {
+                    this.reset_form_for_new_host(cx);
+                    this.show_host_modal = true;
+                    this.form_codename
+                        .update(cx, |f, cx| f.set_text("modal-tofu-02", cx));
+                    this.form_real_host
+                        .update(cx, |f, cx| f.set_text("127.0.0.1", cx));
+                    this.form_real_port
+                        .update(cx, |f, cx| f.set_text(remote_port.to_string(), cx));
+                    this.form_real_user
+                        .update(cx, |f, cx| f.set_text("real_ops_admin", cx));
+                    this.form_real_secret
+                        .update(cx, |f, cx| f.set_text("RealUpstreamSecret#2026", cx));
+                    let (built, _) = this.validate_and_build_host(cx).expect("build modal host");
+                    this.spawn_test_upstream(built, true, cx);
+                });
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+
+                let _ = win_handle.update(cx, |this, _window, cx| {
+                    if this.form_test_ok.is_some() && !this.form_testing {
+                        let (built_after_test, is_new) = this
+                            .validate_and_build_host(cx)
+                            .expect("build modal host after test");
+                        if built_after_test.pinned_host_key_openssh.is_some() {
+                            record(
+                                "[PASS] Phase 7c modal upstream test preserved verified TOFU host key on new host"
+                                    .to_string(),
+                            );
+                        } else {
+                            record(
+                                "[FAIL] Phase 7c modal upstream test dropped TOFU host key on new host"
+                                    .to_string(),
+                            );
+                        }
+                        this.execute_confirmed_action(
+                            PendingAction::SaveHost {
+                                host: Box::new(built_after_test),
+                                is_new,
+                            },
+                            cx,
+                        );
+                    } else {
+                        record(format!(
+                            "[FAIL] Phase 7c modal upstream test did not complete: ok={:?}, err={:?}",
+                            this.form_test_ok, this.form_error
+                        ));
+                    }
+
+                    // 重新从磁盘加载 EncryptedStorage 校验持久化一致性
+                    let reloaded_storage = EncryptedStorage::new_default().expect("reload storage");
+                    let reloaded_hosts = reloaded_storage.load_hosts().expect("reload hosts");
+                    let saved_probe = reloaded_hosts.iter().find(|h| h.id == probe_id);
+                    if saved_probe.is_some_and(|h| {
+                        h.local_port == probe_port
+                            && h.agent_password == rotated_pwd
+                            && h.pinned_host_key_openssh.is_some()
+                    }) {
+                        record(
+                            "[PASS] Phase 7d AES-256-GCM vault reload verified fixed port, rotated password & TOFU key"
+                                .to_string(),
+                        );
+                    } else {
+                        record("[FAIL] Phase 7d vault reload mismatch".to_string());
+                    }
+                });
+
+                // 恢复系统剪贴板、清理临时目录，并在 cx.quit() 前校验退出码（macOS NSApp terminate 会直接退出）
+                let _ = cx.update(|cx| {
+                    if let Some(orig) = orig_clipboard {
+                        cx.write_to_clipboard(ClipboardItem::new_string(orig));
+                    }
+                    let _ = std::fs::remove_dir_all(&temp_path);
+                    let final_findings = findings_inner.lock().unwrap().clone();
+                    let failures: Vec<&String> = final_findings
+                        .iter()
+                        .filter(|s| s.starts_with("[FAIL]"))
+                        .collect();
+                    if !failures.is_empty() {
+                        eprintln!("Live machine E2E uncovered {} issues:", failures.len());
+                        for f in &failures {
+                            eprintln!("  {}", f);
+                        }
+                        std::process::exit(1);
+                    }
+                    let pass_count = final_findings
+                        .iter()
+                        .filter(|s| s.starts_with("[PASS]"))
+                        .count();
+                    println!("ALL {} LIVE SELFTEST CHECKS PASSED!", pass_count);
+                    cx.quit();
+                });
+            })
+            .detach();
+        });
+    }
 }

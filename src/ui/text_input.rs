@@ -52,6 +52,14 @@ pub fn bind_text_input_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DragSelectMode {
+    None,
+    Character,
+    Word { anchor: Range<usize> },
+    All,
+}
+
 pub struct TextField {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -63,7 +71,7 @@ pub struct TextField {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
-    is_selecting: bool,
+    drag_select_mode: DragSelectMode,
 }
 
 impl TextField {
@@ -83,7 +91,7 @@ impl TextField {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
-            is_selecting: false,
+            drag_select_mode: DragSelectMode::None,
         }
     }
 
@@ -98,11 +106,22 @@ impl TextField {
         self.selected_range = len..len;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.drag_select_mode = DragSelectMode::None;
         cx.notify();
     }
 
     pub fn is_masked(&self) -> bool {
         self.is_masked
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn selected_range(&self) -> Range<usize> {
+        self.selected_range.clone()
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn last_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_bounds
     }
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
@@ -168,27 +187,77 @@ impl TextField {
         self.replace_text_in_range(None, "", window, cx);
     }
 
-    fn on_mouse_down(
+    pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.is_selecting = true;
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        window.focus(&self.focus_handle);
+        if event.click_count >= 3 {
+            self.selected_range = 0..self.content.len();
+            self.selection_reversed = false;
+            self.drag_select_mode = DragSelectMode::All;
+            cx.notify();
+        } else if event.click_count == 2 {
+            let range = if self.is_masked {
+                0..self.content.len()
+            } else {
+                let offset = self.index_for_mouse_position(event.position);
+                word_range_at(&self.content, offset)
+            };
+            self.selected_range = range.clone();
+            self.selection_reversed = false;
+            self.drag_select_mode = DragSelectMode::Word { anchor: range };
+            cx.notify();
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+            self.drag_select_mode = DragSelectMode::Character;
+            let offset = self.index_for_mouse_position(event.position);
+            if event.modifiers.shift {
+                self.select_to(offset, cx);
+            } else {
+                self.move_to(offset, cx);
+            }
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
+    pub(crate) fn on_mouse_up(
+        &mut self,
+        _: &MouseUpEvent,
+        _window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.drag_select_mode = DragSelectMode::None;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+    pub(crate) fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.drag_select_mode.clone() {
+            DragSelectMode::None | DragSelectMode::All => {}
+            DragSelectMode::Character => {
+                self.select_to(self.index_for_mouse_position(event.position), cx);
+            }
+            DragSelectMode::Word { anchor } => {
+                if self.is_masked {
+                    return;
+                }
+                let offset = self.index_for_mouse_position(event.position);
+                let target = word_range_at(&self.content, offset);
+                let (new_range, reversed) = if target.start < anchor.start {
+                    (target.start..anchor.end, true)
+                } else {
+                    (anchor.start..target.end, false)
+                };
+                if self.selected_range != new_range || self.selection_reversed != reversed {
+                    self.selected_range = new_range;
+                    self.selection_reversed = reversed;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -236,6 +305,7 @@ impl TextField {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let clamped = self.clamp_to_char_boundary(offset);
         self.selected_range = clamped..clamped;
+        self.selection_reversed = false;
         cx.notify();
     }
 
@@ -256,10 +326,11 @@ impl TextField {
         else {
             return 0;
         };
-        if position.y < bounds.top() {
+        // 允许在 34px 高输入框的上下内边距区域内点击时仍按水平 X 坐标定位字符，仅当拖拽超出输入框上下边缘时跳至首尾
+        if position.y < bounds.top() - px(8.) {
             return 0;
         }
-        if position.y > bounds.bottom() {
+        if position.y > bounds.bottom() + px(8.) {
             return self.content.len();
         }
         let raw = line.closest_index_for_x(position.x - bounds.left());
@@ -716,6 +787,26 @@ pub fn clamp_utf8_boundary(text: &str, offset: usize) -> usize {
     text.floor_char_boundary(offset.min(text.len()))
 }
 
+/// 计算给定 UTF-8 字节偏移处所在的词边界范围（用于双击选词与双击拖拽扩展）
+pub fn word_range_at(text: &str, offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+    let clamped = clamp_utf8_boundary(text, offset);
+    if clamped >= text.len()
+        && let Some((start, seg)) = text.split_word_bound_indices().next_back()
+    {
+        return start..(start + seg.len());
+    }
+    for (start, seg) in text.split_word_bound_indices() {
+        let end = start + seg.len();
+        if clamped >= start && clamped < end {
+            return start..end;
+        }
+    }
+    clamped..clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +828,29 @@ mod tests {
             let idx = clamp_utf8_boundary(s, raw_idx);
             let _ = &s[..idx];
             let _ = &s[idx..];
+        }
+    }
+
+    #[test]
+    fn test_word_range_and_multiclick_selection_boundaries() {
+        let codename = "cobalt-nexus-01";
+        assert_eq!(&codename[word_range_at(codename, 0)], "cobalt");
+        assert_eq!(&codename[word_range_at(codename, 3)], "cobalt");
+        assert_eq!(&codename[word_range_at(codename, 6)], "-");
+        assert_eq!(&codename[word_range_at(codename, 8)], "nexus");
+        assert_eq!(&codename[word_range_at(codename, codename.len())], "01");
+        // 三击全选应覆盖整串（含连字符与全部分段）
+        assert_eq!(&codename[0..codename.len()], "cobalt-nexus-01");
+
+        let empty = "";
+        assert_eq!(word_range_at(empty, 0), 0..0);
+
+        let mixed = "内网测试 108";
+        for offset in 0..=mixed.len() + 2 {
+            let r = word_range_at(mixed, offset);
+            assert!(mixed.is_char_boundary(r.start));
+            assert!(mixed.is_char_boundary(r.end));
+            assert!(r.start <= r.end);
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -19,7 +20,7 @@ use russh::{
 };
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -46,11 +47,13 @@ pub fn global_tokio_runtime() -> &'static tokio::runtime::Runtime {
 pub enum RelayEvent {
     Started {
         host_id: Uuid,
+        instance_id: Uuid,
         codename: String,
         local_port: u16,
     },
     Stopped {
         host_id: Uuid,
+        instance_id: Uuid,
         codename: String,
         local_port: u16,
     },
@@ -73,6 +76,7 @@ pub enum RelayEvent {
     },
     Error {
         host_id: Uuid,
+        instance_id: Uuid,
         codename: String,
         local_port: u16,
         message: String,
@@ -89,6 +93,7 @@ pub struct LiveCredentials {
 
 /// 单条运行中中转实例的控制句柄
 pub struct RunningRelayControl {
+    pub instance_id: Uuid,
     pub local_port: u16,
     pub live_host: Arc<RwLock<RelayHost>>,
     pub live_creds: Arc<RwLock<LiveCredentials>>,
@@ -113,17 +118,42 @@ impl RunningRelayControl {
     }
 }
 
-/// 启动单条主机的本地 SSH 中转服务（强制仅允许绑定本机回环地址，修复 [HIGH-02]）
+/// 启动单条主机的本地 SSH 中转服务（自动分配唯一运行实例 ID）
 pub async fn start_host_relay(
     host: RelayHost,
     initial_creds: LiveCredentials,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
 ) -> Result<RunningRelayControl> {
+    start_host_relay_with_id(host, initial_creds, Uuid::new_v4(), event_tx).await
+}
+
+/// 启动单条主机的本地 SSH 中转服务（指定实例 ID 以隔离固定端口停止/重启事件，强制仅允许绑定本机回环地址）
+pub async fn start_host_relay_with_id(
+    host: RelayHost,
+    initial_creds: LiveCredentials,
+    instance_id: Uuid,
+    event_tx: mpsc::UnboundedSender<RelayEvent>,
+) -> Result<RunningRelayControl> {
     let bind_host = RelayHost::validate_loopback_bind_host(&host.local_bind_host)
         .map_err(|e| anyhow!("{}", e))?;
-    let listener = TcpListener::bind((bind_host.as_str(), host.local_port))
-        .await
-        .with_context(|| format!("绑定本机 {}:{} 端口失败", bind_host, host.local_port))?;
+    let listener = {
+        let max_attempts = if host.local_port > 0 { 12usize } else { 1usize };
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match TcpListener::bind((bind_host.as_str(), host.local_port)).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == ErrorKind::AddrInUse && attempt < max_attempts => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("绑定本机 {}:{} 端口失败", bind_host, host.local_port)
+                    });
+                }
+            }
+        }
+    };
     let local_port = listener
         .local_addr()
         .context("读取本地监听端口失败")?
@@ -141,7 +171,13 @@ pub async fn start_host_relay(
 
     let mut server_cfg = server::Config {
         server_id: SshId::Standard(Cow::Borrowed("SSH-2.0-AgentGate_LocalRelay")),
-        methods: MethodSet::from(&[MethodKind::Password, MethodKind::PublicKey][..]),
+        methods: MethodSet::from(
+            &[
+                MethodKind::Password,
+                MethodKind::KeyboardInteractive,
+                MethodKind::PublicKey,
+            ][..],
+        ),
         auth_rejection_time: Duration::from_millis(80),
         auth_rejection_time_initial: Some(Duration::from_millis(0)),
         keys: vec![host_key],
@@ -167,6 +203,7 @@ pub async fn start_host_relay(
     let codename = host.codename.clone();
     let _ = event_tx.send(RelayEvent::Started {
         host_id,
+        instance_id,
         codename: codename.clone(),
         local_port,
     });
@@ -238,6 +275,7 @@ pub async fn start_host_relay(
                                 .unwrap_or_else(|_| codename.clone());
                             let _ = event_tx.send(RelayEvent::Error {
                                 host_id,
+                                instance_id,
                                 codename: cur_codename,
                                 local_port,
                                 message: format!("本地端口接收连接异常: {}", e),
@@ -255,6 +293,7 @@ pub async fn start_host_relay(
             .unwrap_or(codename);
         let _ = event_tx.send(RelayEvent::Stopped {
             host_id,
+            instance_id,
             codename: final_codename.clone(),
             local_port,
         });
@@ -268,6 +307,7 @@ pub async fn start_host_relay(
     });
 
     Ok(RunningRelayControl {
+        instance_id,
         local_port,
         live_host,
         live_creds,
@@ -611,6 +651,9 @@ impl client::Handler for UpstreamClientHandler {
     }
 }
 
+type UpstreamReplyWaiter = oneshot::Sender<(bool, oneshot::Sender<()>)>;
+type PendingReplyMap = Arc<AsyncMutex<HashMap<ChannelId, VecDeque<UpstreamReplyWaiter>>>>;
+
 /// 本地 SSH 服务端处理器（验证 Agent 凭证并将所有通道透明桥接到上游主机）
 struct LocalSshHandler {
     live_host: Arc<RwLock<RelayHost>>,
@@ -623,6 +666,7 @@ struct LocalSshHandler {
     upstream_failed: bool,
     upstream: Option<Arc<client::Handle<UpstreamClientHandler>>>,
     channels: Arc<AsyncMutex<HashMap<ChannelId, Arc<ChannelWriteHalf<client::Msg>>>>>,
+    pending_replies: PendingReplyMap,
 }
 
 impl LocalSshHandler {
@@ -645,6 +689,7 @@ impl LocalSshHandler {
             upstream_failed: false,
             upstream: None,
             channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            pending_replies: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -707,10 +752,28 @@ impl LocalSshHandler {
         server_handle: server::Handle,
         local_id: ChannelId,
         channels: Arc<AsyncMutex<HashMap<ChannelId, Arc<ChannelWriteHalf<client::Msg>>>>>,
+        pending_replies: PendingReplyMap,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = upstream_read.wait().await {
                 match msg {
+                    ChannelMsg::Success | ChannelMsg::Failure => {
+                        let is_ok = matches!(msg, ChannelMsg::Success);
+                        let waiter = {
+                            let mut map = pending_replies.lock().await;
+                            let popped = map.get_mut(&local_id).and_then(|q| q.pop_front());
+                            if map.get(&local_id).is_some_and(|q| q.is_empty()) {
+                                map.remove(&local_id);
+                            }
+                            popped
+                        };
+                        if let Some(reply_tx) = waiter {
+                            let (ack_tx, ack_rx) = oneshot::channel();
+                            if reply_tx.send((is_ok, ack_tx)).is_ok() {
+                                let _ = ack_rx.await;
+                            }
+                        }
+                    }
                     ChannelMsg::Data { data } => {
                         if local_write.data_bytes(data).await.is_err() {
                             break;
@@ -756,6 +819,7 @@ impl LocalSshHandler {
                 }
             }
             channels.lock().await.remove(&local_id);
+            pending_replies.lock().await.remove(&local_id);
         });
     }
 }
@@ -1001,6 +1065,7 @@ impl server::Handler for LocalSshHandler {
                     session.handle(),
                     local_id,
                     self.channels.clone(),
+                    self.pending_replies.clone(),
                 );
             }
             Err(err) => {
@@ -1041,6 +1106,61 @@ impl server::Handler for LocalSshHandler {
             .reject(ChannelOpenFailure::AdministrativelyProhibited)
             .await;
         Ok(())
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<ServerMsg>,
+        socket_path: &str,
+        reply: server::ChannelOpenHandle,
+        _session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        drop(channel);
+        self.emit_log(
+            "端口转发已拦截",
+            format!(
+                "已根据默认安全隔离策略拒绝 direct-streamlocal Unix Socket 转发 -> {}",
+                socket_path
+            ),
+            true,
+        );
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        _session: &mut ServerSession,
+    ) -> Result<bool, Self::Error> {
+        self.emit_log(
+            "端口转发已拦截",
+            format!(
+                "已根据默认安全隔离策略拒绝远端端口转发 (tcpip-forward -R) -> {}:{}",
+                address, *port
+            ),
+            true,
+        );
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut ServerSession,
+    ) -> Result<bool, Self::Error> {
+        self.emit_log(
+            "端口转发已拦截",
+            format!(
+                "已根据默认安全隔离策略拒绝远端 Unix Socket 转发 (streamlocal-forward) -> {}",
+                socket_path
+            ),
+            true,
+        );
+        Ok(false)
     }
 
     async fn channel_open_x11(
@@ -1157,14 +1277,48 @@ impl server::Handler for LocalSshHandler {
     ) -> Result<(), Self::Error> {
         self.emit_log("子系统请求", format!("subsystem: {}", name), false);
         let up = self.channels.lock().await.get(&channel).cloned();
-        if let Some(up) = up {
-            if up.request_subsystem(false, name).await.is_ok() {
+        let Some(up) = up else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending_replies
+            .lock()
+            .await
+            .entry(channel)
+            .or_default()
+            .push_back(reply_tx);
+
+        if up.request_subsystem(true, name).await.is_err() {
+            let mut map = self.pending_replies.lock().await;
+            if let Some(q) = map.get_mut(&channel) {
+                q.pop_back();
+                if q.is_empty() {
+                    map.remove(&channel);
+                }
+            }
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        }
+
+        match timeout(Duration::from_secs(10), reply_rx).await {
+            Ok(Ok((true, ack_tx))) => {
                 let _ = session.channel_success(channel);
-            } else {
+                let _ = ack_tx.send(());
+            }
+            Ok(Ok((false, ack_tx))) => {
+                self.emit_log(
+                    "子系统被拒绝",
+                    format!("上游服务器未启用或拒绝了子系统 `{}`", name),
+                    true,
+                );
+                let _ = session.channel_failure(channel);
+                let _ = ack_tx.send(());
+            }
+            _ => {
                 let _ = session.channel_failure(channel);
             }
-        } else {
-            let _ = session.channel_failure(channel);
         }
         Ok(())
     }
@@ -1266,6 +1420,7 @@ impl server::Handler for LocalSshHandler {
         channel: ChannelId,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.pending_replies.lock().await.remove(&channel);
         let removed = self.channels.lock().await.remove(&channel);
         if let Some(up) = removed {
             let _ = up.close().await;
@@ -1417,6 +1572,25 @@ mod tests {
             let _ = session.channel_success(channel);
             let handle = session.handle();
             let _ = handle.data(channel, Bytes::from("SHELL_READY$ ")).await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            name: &str,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            if name == "mock_sftp" {
+                let _ = session.channel_success(channel);
+                let handle = session.handle();
+                let _ = handle.data(channel, Bytes::from("SFTP_READY\n")).await;
+                let _ = handle.exit_status_request(channel, 0).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            } else {
+                let _ = session.channel_failure(channel);
+            }
             Ok(())
         }
 
@@ -2234,5 +2408,161 @@ mod tests {
         );
 
         control.stop();
+    }
+
+    #[tokio::test]
+    async fn test_keyboard_interactive_auth_fixed_port_restart_and_subsystem_reply_forwarding() {
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
+        let remote_port = remote_listener.local_addr().expect("remote addr").port();
+        let remote_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("remote key");
+        let remote_cfg = Arc::new(server::Config {
+            keys: vec![remote_key],
+            auth_rejection_time: Duration::from_millis(10),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = remote_listener.accept().await {
+                let cfg = remote_cfg.clone();
+                tokio::spawn(async move {
+                    let handler = MockRemoteSshServer {
+                        expected_user: "ops_root".to_string(),
+                        expected_password: "OpsRealPassword#2026".to_string(),
+                    };
+                    let _ = server::run_stream(cfg, socket, handler).await;
+                });
+            }
+        });
+
+        let fixed_port = RelayHost::allocate_free_local_port("127.0.0.1");
+        let mut host = RelayHost::new_template(3);
+        host.codename = "kbd-fixed-01".to_string();
+        host.local_bind_host = "127.0.0.1".to_string();
+        host.local_port = fixed_port;
+        host.real_host = "127.0.0.1".to_string();
+        host.real_port = remote_port;
+        host.real_user = "ops_root".to_string();
+        host.real_auth = RealAuthConfig::Password {
+            password: "OpsRealPassword#2026".to_string(),
+        };
+        let local_pwd = host.agent_password.clone();
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let inst_1 = Uuid::new_v4();
+        let ctrl_1 = start_host_relay_with_id(
+            host.clone(),
+            LiveCredentials {
+                mode: AgentAuthMode::EphemeralPassword,
+                temp_password: Some(local_pwd.clone()),
+                dedicated_pubkey: None,
+            },
+            inst_1,
+            event_tx.clone(),
+        )
+        .await
+        .expect("start inst 1");
+        assert_eq!(ctrl_1.local_port, fixed_port);
+        assert_eq!(ctrl_1.instance_id, inst_1);
+
+        // 模拟 UI 固定端口「停止 -> 立即重启」：旧实例异步释放端口期间新实例自动重试绑定并携带独立 instance_id
+        ctrl_1.stop();
+        let inst_2 = Uuid::new_v4();
+        let ctrl_2 = start_host_relay_with_id(
+            host.clone(),
+            LiveCredentials {
+                mode: AgentAuthMode::EphemeralPassword,
+                temp_password: Some(local_pwd.clone()),
+                dedicated_pubkey: None,
+            },
+            inst_2,
+            event_tx,
+        )
+        .await
+        .expect("restart inst 2 on same fixed port");
+        assert_eq!(ctrl_2.local_port, fixed_port);
+        assert_eq!(ctrl_2.instance_id, inst_2);
+        assert_ne!(inst_1, inst_2);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let mut stopped_instances = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let RelayEvent::Stopped { instance_id, .. } = ev {
+                stopped_instances.push(instance_id);
+            }
+        }
+        assert!(
+            stopped_instances.contains(&inst_1) && !stopped_instances.contains(&inst_2),
+            "only inst_1 should have emitted Stopped; inst_2 must remain alive"
+        );
+
+        // 验证 keyboard-interactive 挑战应答认证在新实例上正常协商通过
+        let client_cfg = Arc::new(client::Config::default());
+        let mut sess = client::connect(
+            client_cfg,
+            ("127.0.0.1", fixed_port),
+            UpstreamClientHandler::permissive_for_test(),
+        )
+        .await
+        .expect("connect restarted relay");
+        let kbd_start = sess
+            .authenticate_keyboard_interactive_start("kbd-fixed-01", None)
+            .await
+            .expect("kbd start");
+        assert!(
+            matches!(
+                kbd_start,
+                client::KeyboardInteractiveAuthResponse::InfoRequest { .. }
+            ),
+            "server MethodSet must advertise keyboard-interactive and issue prompt"
+        );
+        let kbd_done = sess
+            .authenticate_keyboard_interactive_respond(vec![local_pwd])
+            .await
+            .expect("kbd respond");
+        assert!(
+            matches!(kbd_done, client::KeyboardInteractiveAuthResponse::Success),
+            "keyboard-interactive password response must succeed"
+        );
+
+        // 验证远端未启用子系统时立即收到 ChannelMsg::Failure（不伪造 CHANNEL_SUCCESS 导致客户端死等）
+        let mut bad_sub_chan = sess.channel_open_session().await.expect("open bad sub");
+        bad_sub_chan
+            .request_subsystem(true, "disabled_subsys")
+            .await
+            .expect("req bad subsys");
+        let first_reply = timeout(Duration::from_secs(2), bad_sub_chan.wait())
+            .await
+            .expect("bad subsystem must not hang")
+            .expect("channel msg");
+        assert!(
+            matches!(first_reply, ChannelMsg::Failure),
+            "missing upstream subsystem must forward CHANNEL_FAILURE"
+        );
+        let _ = bad_sub_chan.close().await;
+
+        // 验证远端支持子系统时正常返回 ChannelMsg::Success 与下行数据流
+        let mut ok_sub_chan = sess.channel_open_session().await.expect("open ok sub");
+        ok_sub_chan
+            .request_subsystem(true, "mock_sftp")
+            .await
+            .expect("req mock_sftp");
+        let mut got_sub_ok = false;
+        let mut sub_data = Vec::new();
+        while let Some(msg) = timeout(Duration::from_secs(2), ok_sub_chan.wait())
+            .await
+            .expect("mock_sftp should not hang")
+        {
+            match msg {
+                ChannelMsg::Success => got_sub_ok = true,
+                ChannelMsg::Data { data } => sub_data.extend_from_slice(&data),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert!(got_sub_ok);
+        assert_eq!(String::from_utf8_lossy(&sub_data), "SFTP_READY\n");
+
+        ctrl_2.stop();
     }
 }

@@ -15,6 +15,12 @@ use gpui::{
 use ui::{AgentGateWorkbench, QuitApp, register_workbench_keys};
 
 fn main() {
+    #[cfg(debug_assertions)]
+    if std::env::var("AGENTGATE_LIVE_SELFTEST").as_deref() == Ok("1") {
+        ui::live_selftest::run_live_workbench_selftest();
+        return;
+    }
+
     if let Ok(showcase_path) = std::env::var("AGENTGATE_EXPORT_ICON_SHOWCASE")
         && !showcase_path.trim().is_empty()
     {
@@ -59,11 +65,12 @@ fn main() {
         register_workbench_keys(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
 
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(1040.0), px(680.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("AgentGate".into()),
                     appears_transparent: cfg!(not(target_os = "macos")),
