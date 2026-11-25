@@ -65,6 +65,7 @@ pub struct TextField {
     content: SharedString,
     placeholder: SharedString,
     is_masked: bool,
+    allow_newlines: bool,
     is_dark: bool,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -85,6 +86,7 @@ impl TextField {
             content: "".into(),
             placeholder: placeholder.into(),
             is_masked,
+            allow_newlines: false,
             is_dark: true,
             selected_range: 0..0,
             selection_reversed: false,
@@ -127,6 +129,10 @@ impl TextField {
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
         self.is_masked = masked;
         cx.notify();
+    }
+
+    pub fn set_allow_newlines(&mut self, allow: bool) {
+        self.allow_newlines = allow;
     }
 
     pub fn set_dark(&mut self, is_dark: bool, cx: &mut Context<Self>) {
@@ -272,7 +278,14 @@ impl TextField {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let cleaned = text.replace(['\r', '\n'], "");
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let looks_like_pem =
+                normalized.contains("-----BEGIN ") && normalized.contains("-----END ");
+            let cleaned = if self.allow_newlines || looks_like_pem {
+                normalized.trim().to_string()
+            } else {
+                normalized.replace('\n', "")
+            };
             self.replace_text_in_range(None, &cleaned, window, cx);
         }
     }
@@ -404,8 +417,8 @@ impl TextField {
         if self.is_masked {
             // 保持与原 UTF-8 字节长度完全一致，确保光标与选区字节偏移精确对齐
             "*".repeat(self.content.len()).into()
-        } else if self.content.contains('\n') {
-            self.content.replace('\n', " ").into()
+        } else if self.content.contains(['\n', '\r']) {
+            self.content.replace(['\n', '\r'], " ").into()
         } else {
             self.content.clone()
         }

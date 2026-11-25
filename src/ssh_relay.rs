@@ -321,6 +321,226 @@ struct UpstreamClientHandler {
     event_tx: Option<mpsc::UnboundedSender<RelayEvent>>,
 }
 
+/// 规范化用户粘贴或仓库存储的 SSH 私钥 PEM 文本：
+/// 自动修复单行无换行粘贴（如 `-----BEGIN OPENSSH PRIVATE KEY-----XXX-----END OPENSSH PRIVATE KEY-----`）、
+/// `\r\n` / 转义 `\n`、首尾引号、拖拽漏选连字符及非标准 Base64 折行宽度（OpenSSH 70 列 / RFC7468 64 列）
+pub fn normalize_private_key_pem(raw: &str) -> String {
+    normalize_private_key_pem_with_width(raw, None)
+}
+
+fn normalize_private_key_pem_with_width(raw: &str, custom_width: Option<usize>) -> String {
+    let mut s = raw
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .to_string();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].trim().to_string();
+    }
+    s = s.replace("\r\n", "\n").replace('\r', "\n");
+    if s.contains("BEGIN ") && (s.contains("\\n") || s.contains("\\r\\n")) {
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n");
+    }
+
+    let mut search_offset = 0usize;
+    while let Some(rel_begin) = s[search_offset..].find("BEGIN ") {
+        let begin_kw_idx = search_offset + rel_begin;
+        if !s[..begin_kw_idx].ends_with('-') {
+            search_offset = begin_kw_idx + "BEGIN ".len();
+            continue;
+        }
+        let label_start = begin_kw_idx + "BEGIN ".len();
+        let after_begin = &s[label_start..];
+        let Some(label_end_rel) = after_begin.find('-') else {
+            break;
+        };
+        let label = after_begin[..label_end_rel].trim();
+        if label.is_empty()
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ' ')
+        {
+            search_offset = label_start + label_end_rel + 1;
+            continue;
+        }
+        let dashes_after_begin = after_begin[label_end_rel..]
+            .chars()
+            .take_while(|&c| c == '-')
+            .count();
+        if dashes_after_begin == 0 {
+            search_offset = label_start + label_end_rel + 1;
+            continue;
+        }
+        let body_start = label_start + label_end_rel + dashes_after_begin;
+        let end_marker = format!("END {}", label);
+        let Some(end_kw_rel) = s[body_start..].find(&end_marker) else {
+            break;
+        };
+        let end_kw_idx = body_start + end_kw_rel;
+        let dashes_before_end = s[body_start..end_kw_idx]
+            .chars()
+            .rev()
+            .take_while(|&c| c == '-')
+            .count();
+        if dashes_before_end == 0 {
+            search_offset = end_kw_idx + end_marker.len();
+            continue;
+        }
+        let body_end = end_kw_idx - dashes_before_end;
+        let raw_body = &s[body_start..body_end];
+
+        let wrap_width = custom_width.unwrap_or_else(|| {
+            if label.contains("OPENSSH") { 70 } else { 64 }
+        });
+
+        let mut rfc1421_headers = Vec::new();
+        let mut b64_buf = String::with_capacity(raw_body.len());
+        if raw_body.contains(':') && raw_body.contains('\n') {
+            for line in raw_body.lines() {
+                let t = line.trim();
+                if t.contains(':') {
+                    rfc1421_headers.push(t.to_string());
+                } else {
+                    b64_buf.extend(t.chars().filter(|c| !c.is_whitespace()));
+                }
+            }
+        } else {
+            b64_buf.extend(raw_body.chars().filter(|c| !c.is_whitespace()));
+        }
+
+        if b64_buf.is_empty() {
+            break;
+        }
+
+        let header = format!("-----BEGIN {}-----", label);
+        let footer = format!("-----END {}-----", label);
+        let mut out = String::with_capacity(header.len() + footer.len() + b64_buf.len() + 64);
+        out.push_str(&header);
+        out.push('\n');
+        if !rfc1421_headers.is_empty() {
+            for h in &rfc1421_headers {
+                out.push_str(h);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        let chars: Vec<char> = b64_buf.chars().collect();
+        for chunk in chars.chunks(wrap_width) {
+            for &ch in chunk {
+                out.push(ch);
+            }
+            out.push('\n');
+        }
+        out.push_str(&footer);
+        out.push('\n');
+        return out;
+    }
+
+    s
+}
+
+/// 解析并校验真实远端 SSH 私钥（支持单行/多行 OpenSSH、PKCS#1、SEC1、PKCS#8 私钥及口令诊断）
+pub fn decode_upstream_private_key(
+    raw_pem: &str,
+    passphrase: Option<&str>,
+) -> Result<PrivateKey> {
+    let pass_clean = passphrase
+        .map(|p| p.trim_matches(['\r', '\n']))
+        .filter(|p| !p.is_empty());
+
+    let raw_trimmed = raw_pem
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+
+    let primary = normalize_private_key_pem(raw_pem);
+    let alt_64 = normalize_private_key_pem_with_width(raw_pem, Some(64));
+    let alt_70 = normalize_private_key_pem_with_width(raw_pem, Some(70));
+
+    let mut candidates = Vec::with_capacity(4);
+    for cand in [primary, raw_trimmed.clone(), alt_64, alt_70] {
+        if !cand.is_empty() && !candidates.contains(&cand) {
+            candidates.push(cand);
+        }
+    }
+
+    let mut last_err_msg = String::from("Could not read key");
+    for cand in &candidates {
+        if cand.contains("BEGIN OPENSSH PRIVATE KEY")
+            && let Ok(pk) = PrivateKey::from_openssh(cand)
+        {
+            if !pk.is_encrypted() {
+                return Ok(pk);
+            }
+            let Some(pw) = pass_clean else {
+                return Err(anyhow!(
+                    "该 OpenSSH 私钥受加密口令保护，请填写「真实私钥解密口令」"
+                ));
+            };
+            return pk
+                .decrypt(pw)
+                .map_err(|_| anyhow!("OpenSSH 私钥解密失败，请核对「真实私钥解密口令」是否正确"));
+        }
+
+        match decode_secret_key(cand, pass_clean) {
+            Ok(pk) => return Ok(pk),
+            Err(e) => {
+                if pass_clean.is_some()
+                    && let Ok(pk) = decode_secret_key(cand, None)
+                {
+                    return Ok(pk);
+                }
+                last_err_msg = e.to_string();
+            }
+        }
+    }
+
+    let t = raw_trimmed.trim();
+    if t.starts_with("ssh-")
+        || t.starts_with("ecdsa-sha2-")
+        || t.starts_with("sk-ssh-")
+        || t.starts_with("sk-ecdsa-")
+    {
+        return Err(anyhow!(
+            "检测到输入为 SSH 公钥 (.pub)，请粘贴对应的私钥 PEM 全文（以 -----BEGIN ... PRIVATE KEY----- 开头）"
+        ));
+    }
+    if t.starts_with("PuTTY-User-Key-File") {
+        return Err(anyhow!(
+            "暂不支持 PuTTY (.ppk) 格式私钥，请先通过 puttygen 或 ssh-keygen 转换为 OpenSSH / PEM 私钥"
+        ));
+    }
+    if !t.contains("BEGIN ")
+        && (t.starts_with("~/")
+            || t.starts_with('/')
+            || t.contains("\\.ssh\\")
+            || t.ends_with(".pem")
+            || t.ends_with("id_rsa")
+            || t.ends_with("id_ed25519"))
+    {
+        return Err(anyhow!(
+            "检测到输入为文件路径而非私钥内容，请打开该私钥文件并粘贴完整 PEM 文本"
+        ));
+    }
+    if t.contains("ENCRYPTED") {
+        if pass_clean.is_none() {
+            return Err(anyhow!(
+                "该私钥受加密口令保护，请填写「真实私钥解密口令」"
+            ));
+        }
+        return Err(anyhow!(
+            "加密私钥解密失败，请检查「真实私钥解密口令」是否正确 ({})",
+            last_err_msg
+        ));
+    }
+
+    Err(anyhow!(
+        "私钥内容不完整或 Base64 已损坏，请粘贴完整的 -----BEGIN ... PRIVATE KEY----- 至 -----END ... PRIVATE KEY----- 文本 ({})",
+        last_err_msg
+    ))
+}
+
 /// 建立并认证到真实远端上游 SSH 主机的连接（供实时中转与「上游测试」功能共同复用）
 async fn connect_and_authenticate_upstream(
     host: &RelayHost,
@@ -495,16 +715,15 @@ async fn connect_and_authenticate_upstream(
                 private_key_pem,
                 passphrase,
             } => {
-                let decoded_key = decode_secret_key(
-                    private_key_pem,
-                    passphrase.as_deref().filter(|p| !p.is_empty()),
-                )
-                .map_err(|e| {
-                    anyhow!(
-                        "[阶段: 本地私钥解析] 解析真实远端私钥失败 ({})",
-                        sanitize_error(&e.to_string(), host)
-                    )
-                })?;
+                let decoded_key =
+                    decode_upstream_private_key(private_key_pem, passphrase.as_deref()).map_err(
+                        |e| {
+                            anyhow!(
+                                "[阶段: 本地私钥解析] 解析真实远端私钥失败 ({})",
+                                sanitize_error(&e.to_string(), host)
+                            )
+                        },
+                    )?;
                 let rsa_hash = if decoded_key.algorithm().is_rsa() {
                     handle
                         .best_supported_rsa_hash()
@@ -2564,5 +2783,135 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&sub_data), "SFTP_READY\n");
 
         ctrl_2.stop();
+    }
+
+    #[tokio::test]
+    async fn test_single_line_and_malformed_private_key_pem_normalization_and_upstream_auth() {
+        use russh::keys::ssh_key::LineEnding;
+
+        // 1. 生成真实 OpenSSH Ed25519 私钥，并构造单行无换行粘贴格式：
+        // `-----BEGIN OPENSSH PRIVATE KEY-----XXXXXXX-----END OPENSSH PRIVATE KEY-----`
+        let upstream_priv =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("gen ed25519");
+        let expected_pub = upstream_priv.public_key().clone();
+        let openssh_pem = upstream_priv
+            .to_openssh(LineEnding::LF)
+            .expect("to_openssh")
+            .to_string();
+        let crushed_single_line = openssh_pem.replace(['\r', '\n'], "");
+        assert!(!crushed_single_line.contains('\n'));
+        assert!(crushed_single_line.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(crushed_single_line.ends_with("-----END OPENSSH PRIVATE KEY-----"));
+
+        // 验证单行无换行格式、首尾漏选连字符格式、转义 \n 格式均可无损解析还原
+        let decoded_crushed = decode_upstream_private_key(&crushed_single_line, None)
+            .expect("crushed single-line OpenSSH PEM must decode cleanly");
+        assert_eq!(decoded_crushed.public_key(), &expected_pub);
+
+        let partial_dash = crushed_single_line
+            .trim_start_matches('-')
+            .trim_end_matches('-');
+        let partial_dash_pem = format!("--{}--", partial_dash);
+        let decoded_partial = decode_upstream_private_key(&partial_dash_pem, None)
+            .expect("partial-dash single-line OpenSSH PEM must decode cleanly");
+        assert_eq!(decoded_partial.public_key(), &expected_pub);
+
+        let escaped_nl_pem = format!("\"{}\"", openssh_pem.replace('\n', "\\n"));
+        let decoded_escaped = decode_upstream_private_key(&escaped_nl_pem, None)
+            .expect("escaped \\n PEM must decode cleanly");
+        assert_eq!(decoded_escaped.public_key(), &expected_pub);
+
+        // 验证无口令私钥即使误填口令也可容错通过
+        let decoded_with_extra_pass =
+            decode_upstream_private_key(&crushed_single_line, Some("unused-pass"))
+                .expect("unencrypted key should tolerate extraneous passphrase");
+        assert_eq!(decoded_with_extra_pass.public_key(), &expected_pub);
+
+        // 2. 验证带口令加密的 OpenSSH 私钥（含单行无换行粘贴）
+        let encrypted_priv = upstream_priv
+            .clone()
+            .encrypt(&mut rand::rng(), b"StrongKeyPass#2026")
+            .expect("encrypt openssh key");
+        let encrypted_crushed = encrypted_priv
+            .to_openssh(LineEnding::LF)
+            .expect("enc to_openssh")
+            .replace(['\r', '\n'], "");
+        let missing_pw_err = decode_upstream_private_key(&encrypted_crushed, None)
+            .expect_err("encrypted key without passphrase must fail");
+        assert!(missing_pw_err.to_string().contains("口令"));
+
+        let wrong_pw_err = decode_upstream_private_key(&encrypted_crushed, Some("WrongPass"))
+            .expect_err("encrypted key with wrong passphrase must fail");
+        assert!(wrong_pw_err.to_string().contains("口令"));
+
+        let decrypted_ok =
+            decode_upstream_private_key(&encrypted_crushed, Some("StrongKeyPass#2026\n"))
+                .expect("encrypted single-line key with valid passphrase must succeed");
+        assert_eq!(decrypted_ok.public_key(), &expected_pub);
+
+        // 3. 验证常见误填场景的中文精准提示（误粘 .pub 公钥 / 文件路径 / PuTTY .ppk）
+        let pub_line = expected_pub.to_openssh().expect("pub openssh");
+        let pub_err = decode_upstream_private_key(&pub_line, None).unwrap_err();
+        assert!(pub_err.to_string().contains("公钥"));
+
+        let path_err = decode_upstream_private_key("~/.ssh/id_ed25519", None).unwrap_err();
+        assert!(path_err.to_string().contains("路径"));
+
+        let ppk_err =
+            decode_upstream_private_key("PuTTY-User-Key-File-3: ssh-ed25519", None).unwrap_err();
+        assert!(ppk_err.to_string().contains("PuTTY"));
+
+        // 4. 启动仅接受公钥认证的真实上游 SSH 服务端，端到端验证单行无换行私钥通过 test_upstream_connection
+        struct PubkeyOnlyServer {
+            expected_pub: PublicKey,
+        }
+        impl server::Handler for PubkeyOnlyServer {
+            type Error = russh::Error;
+            async fn auth_publickey(
+                &mut self,
+                user: &str,
+                key: VerifiedPublicKey<'_>,
+            ) -> Result<Auth, Self::Error> {
+                if user == "ubuntu" && key.public_key == &self.expected_pub {
+                    Ok(Auth::Accept)
+                } else {
+                    Ok(Auth::reject())
+                }
+            }
+        }
+
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote");
+        let remote_port = remote_listener.local_addr().expect("remote addr").port();
+        let server_host_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("server key");
+        let remote_cfg = Arc::new(server::Config {
+            keys: vec![server_host_key],
+            auth_rejection_time: Duration::from_millis(10),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = remote_listener.accept().await {
+                let cfg = remote_cfg.clone();
+                let exp = expected_pub.clone();
+                tokio::spawn(async move {
+                    let _ = server::run_stream(cfg, socket, PubkeyOnlyServer { expected_pub: exp })
+                        .await;
+                });
+            }
+        });
+
+        let mut host = RelayHost::new_template(9);
+        host.real_host = "127.0.0.1".to_string();
+        host.real_port = remote_port;
+        host.real_user = "ubuntu".to_string();
+        host.real_auth = RealAuthConfig::PrivateKey {
+            private_key_pem: crushed_single_line,
+            passphrase: None,
+        };
+        let (_ms, pinned) = test_upstream_connection(host)
+            .await
+            .expect("single-line OpenSSH private key must pass upstream connectivity test");
+        assert!(pinned.is_some());
     }
 }
